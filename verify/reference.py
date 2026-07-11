@@ -45,16 +45,20 @@ def ref_sparse_mla_decode(
     rows. Rows selecting nothing produce zeros (not NaN).
     """
     seq_q, h_q, _ = q.shape
-    kv = ref_dequant_fp8_ds_mla_row(kv_u8).float()     # [num_slots, 576]
+    rows = kv_u8.reshape(-1, ROW_BYTES)
+    n_slots = rows.shape[0]
     qf = q.float()
     out = torch.zeros(seq_q, h_q, NOPE, dtype=torch.float32, device=q.device)
 
     for t in range(seq_q):
         sel = indices[t]
-        sel = sel[(sel >= 0) & (sel < kv.shape[0])].long()
+        sel = sel[(sel >= 0) & (sel < n_slots)].long()
         if sel.numel() == 0:
             continue
-        k = kv[sel]                                     # [S, 576]
+        # gather THEN dequantize: dequantizing the whole pool first would
+        # materialize num_slots x 576 fp32 (8 GB at a 3.5M-slot pool) — the
+        # reference must not be more expensive than the kernel it checks.
+        k = ref_dequant_fp8_ds_mla_row(rows[sel]).float()   # [S, 576]
         scores = (qf[t] @ k.T) * sm_scale               # [h_q, S]
         w = torch.softmax(scores, dim=-1)
         out[t] = w @ k[:, :NOPE]                        # V = NoPE half
