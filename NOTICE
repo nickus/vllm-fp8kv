@@ -1,0 +1,13 @@
+vllm-fp8kv — fp8 KV-cache support for vLLM's Ampere DSA path (TRITON_MLA_SPARSE)
+Copyright 2026 Nick / vllm-fp8kv contributors
+
+This product continues an attribution chain:
+  renning22/glm-5.2-4090 (Apache-2.0)  — the original portable DSA kernel stack (sm_89)
+    -> nickus/dsa-3090   (Apache-2.0)  — sm_86 port: FP8-as-storage software dequant/encode,
+                                         the only Ampere fp8-KV DSA path (see its FINAL_REPORT.md)
+      -> this repo                     — bringing that fp8-KV capability into vLLM
+
+Also derived from / building on:
+  vllm-project/vllm (Apache-2.0), in particular PR #38476 (haosdent) and its
+  takeover PR #47629 — the TRITON_MLA_SPARSE Ampere sparse-MLA backend, which
+  is bf16-KV-only because Triton cannot compile fp8e4nv on sm_80/86.
