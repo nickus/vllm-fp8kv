@@ -112,3 +112,19 @@ B/token = **1.76× capacity left on the table**); a 2026-04-20 comment on
 131) — so `--kv-cache-dtype fp8` with TRITON_MLA on Ampere is *accepted* today
 but its read path lowers to `fp8e4nv` conversion, which Triton rejects on
 sm_8x. Likely broken-on-arrival; verify on the bench box and file.
+
+## D1 CONFIRMED ON HARDWARE (2026-07-11, RTX 3090, driver 580, vLLM 0.24.0)
+
+The scope-reduction assumption held: **vLLM's C++ `concat_and_cache_ds_mla`
+writer runs on sm_86 unmodified** (`ENABLE_FP8` is CUDA-version-gated, not
+arch-gated — confirmed by execution, not inference). Contract tests:
+
+| check | result |
+|---|---|
+| layout row / scale-offset / rope-offset vs vLLM's own | 656 / 512 / 528 — match |
+| writer stores RoPE raw bf16 | max_abs 0.0 (exact) |
+| **k_scale=2.0 passed to the writer** | **correctly IGNORED** (inline per-tile scales) — pins the scale contract |
+| our decode over pages written by THEIR writer | **cosine 0.999996** |
+
+=> No cache-write port is needed. D1 is: declare `fp8_ds_mla` in the backend's
+`supported_kv_cache_dtypes` + `_canonicalize_sparse_mla_kv_cache_dtype`.
