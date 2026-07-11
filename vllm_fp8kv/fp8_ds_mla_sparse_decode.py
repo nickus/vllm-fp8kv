@@ -97,7 +97,13 @@ def _fp8_ds_mla_sparse_decode_kernel(
     index_topk: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    # geometry as constexpr params: Triton JIT cannot read plain module globals
+    NOPE: tl.constexpr,
+    ROPE: tl.constexpr,
+    TILE: tl.constexpr,
     N_TILES: tl.constexpr,
+    SCALE_OFF: tl.constexpr,
+    ROPE_OFF: tl.constexpr,
     WRITE_LSE: tl.constexpr,
 ):
     # int64: with h_q=128, stride_q_token=73728 -> cur_q * stride overflows
@@ -264,7 +270,12 @@ def fp8_ds_mla_sparse_decode(
         index_topk=topk,
         BLOCK_H=block_h,
         BLOCK_N=block_n,
+        NOPE=NOPE,
+        ROPE=ROPE,
+        TILE=TILE,
         N_TILES=NOPE // TILE,
+        SCALE_OFF=SCALE_OFF,
+        ROPE_OFF=ROPE_OFF,
         WRITE_LSE=return_lse,
         num_stages=num_stages,
         num_warps=num_warps,

@@ -147,9 +147,13 @@ def section_bigpool(rep, device):
         return
     from vllm_fp8kv.fp8_ds_mla_sparse_decode import fp8_ds_mla_sparse_decode
 
+    # the earlier sections leave several GB resident; this pool is 2.3 GB and
+    # must be allocated on a clean allocator or it OOMs for the wrong reason.
+    torch.cuda.empty_cache()
     n_slots = 3_500_000                       # 3.5M * 656 = 2.30e9 > 2^31
-    if torch.cuda.get_device_properties(0).total_memory < 6e9:
-        rep.skip("bigpool/int64-offsets", "needs ~2.3GB free")
+    free, _ = torch.cuda.mem_get_info()
+    if free < 3.5e9:
+        rep.skip("bigpool/int64-offsets", f"needs ~2.4GB free, have {free/1e9:.1f}GB")
         return
     kv = torch.zeros(n_slots, 656, dtype=torch.uint8, device=device)
     small, _ = _rand_kv(2, seed=7, device=device)
@@ -176,6 +180,8 @@ def main():
     section_dequant(rep, device)
     section_layout(rep, device)
     section_decode(rep, device)
+    if device == "cuda":
+        torch.cuda.empty_cache()
     section_bigpool(rep, device)
     print(f"== done: {rep.failed} failure(s) ==")
     sys.exit(min(rep.failed, 125))
