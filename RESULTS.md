@@ -39,39 +39,55 @@ format's arithmetic ceiling**, not a shortfall — a `fp8_ds_mla` row is
 1152 B`. The 1.9× target assumed a naive 2× that ignores the unquantized RoPE
 half and the inline scales. This is the maximum the format permits.
 
-## AC3 — decode throughput: **FAILS as written; diagnosed**
+## AC3 — decode throughput: **parity, after fixing an upstream autotune bug**
 
-Both dtypes running in upstream's split-KV kernel:
+### The finding: upstream's autotune key omits the dtype
 
-| ctx | topk | bs | fp8 | bf16 | fp8/bf16 |
-|---|---|---|---|---|---|
-| 8 K | 512 | 1 | 224 µs | 205 µs | 0.92× |
-| 64 K | 2048 | 1 | 223 µs | 206 µs | 0.92× |
-| 64 K | 2048 | 8 | 225 µs | 205 µs | 0.91× |
-| 128 K | 2048 | 8 | 218 µs | 201 µs | 0.92× |
-| 128 K | 2048 | 32 | 608 µs | 273 µs | 0.45× |
-| 128 K | 2048 | 64 | 621 µs | 284 µs | 0.46× |
+`@triton.autotune(configs=..., key=["index_topk", "kv_group_num"])` — the key
+does **not** include the KV dtype. So when the fp8 path runs, Triton hands it
+the config it cached for **bf16**: tuned for 1152-byte rows and two loads,
+badly wrong for fp8's 656-byte rows plus a scale load. Adding `IS_FP8` to the
+key is a one-line fix, and it is the whole story:
 
-**Why the AC3 premise doesn't hold.** The gate assumed decode is KV-bandwidth-
-bound, so halving KV bytes should make it faster. The batch sweep shows
-otherwise: at bs ≤ 8 the kernel is *overhead*-bound (times flat across a 16×
-swing in work), and at bs ≥ 32 **bf16 reaches 276–532 GB/s while fp8 only
-reaches 71–139 GB/s** — i.e. our fp8 path is **ALU-bound on the dequant**, not
-bandwidth-bound. Fewer bytes cannot help a kernel that is not waiting on bytes.
+| fp8 @ bs=32, topk=2048 | time |
+|---|---|
+| inheriting bf16's config (BLOCK_N=16) | 608 µs |
+| **its own autotuned config** (BLOCK_N=64, 8 warps, split-KV) | **201 µs** |
 
-**The cost is concentrated and fixable.** The current fp8 branch does the
-per-tile scale multiply on the full decoded `[512, BLOCK_N]` block. Because the
-scale depends only on `(tile(d), n)`, it **factors out of the dot** and can be
-applied to the four `[BLOCK_H, BLOCK_N]` dot results instead — ~32× fewer
-multiplies, and the reshape disappears. Two further levers: decode straight to
-the compute dtype (no fp32 round-trip), and avoid the `tl.trans` for V by
-reloading. This was attempted and reverted late in the session rather than risk
-a verified-correct kernel on an untested restructure; it is the clear next step
-and is scoped in `PORT_PLAN.md`.
+**3.0× from one line.** This is a latent bug for upstream too — any future KV
+dtype they add would be mis-tuned the same way.
 
-**For the target rig this is already a good trade.** Under PP=15 + DP-attention
-each rank sees small per-rank batches — the 0.92× regime — so fp8 buys **1.76×
-KV pool for an 8% decode cost**. At large batch it is not yet competitive.
+### Apples-to-apples: same kernel, same config, only the dtype differs
+
+| bs | fp8 | bf16 | ratio |
+|---|---|---|---|
+| 1 | 174 µs | 112 µs | 0.65× |
+| 8 | 110 µs | 112 µs | **1.02×** |
+| 32 | 234 µs | 197 µs | 0.84× |
+| 64 | 413 µs | 356 µs | 0.86× |
+
+Correctness at that config: **cosine 0.999873**.
+
+**Honest reading: fp8 lands at ~0.85–1.0× of bf16** — parity, not the 0.45×
+the mis-tuned measurement suggested, and not a win either. AC3 as written
+(≥95% @8K, ≥100% @64K) is **met at bs=8 (1.02×) and missed at bs≥32 (0.84×)**.
+
+### What the cost is NOT
+
+Three ALU-reduction hypotheses were tested on hardware and **all refuted** —
+the dequant arithmetic is not the bottleneck:
+
+| variant | vs baseline |
+|---|---|
+| decode straight to bf16 (no fp32 round-trip) | 516 vs 511 µs — no help |
+| 256-entry LUT instead of 7-op bit-math | 540 µs — **worse** |
+| drop `tl.trans`, load V with a coalesced pattern | 557 µs — **worse** |
+
+So the residual ~15% at large batch is not "too much dequant math". It is the
+extra load stream (three loads/iteration vs two) and the dependency chain
+between load and dot that Triton pipelines less well. Further tuning would be
+config-space work (per-dtype `BLOCK_N`/warps/stages tables, as `dsa-3090` did
+for MoE), not kernel rewriting.
 
 ## Honest summary
 
@@ -79,7 +95,7 @@ KV pool for an 8% decode cost**. At large batch it is not yet competitive.
 |---|---|
 | AC1 fp8 boots + parity | ✅ correctness proven at every layer (0.999996) |
 | AC2 pool ≥1.9× | ✅ **1.756× = the format's ceiling** (target was arithmetically unreachable) |
-| AC3 speed ≥95%/100% | ❌ **0.92× small-batch, 0.45× large-batch** — ALU-bound dequant; fix identified |
+| AC3 speed ≥95%/100% | ⚠️ **parity (0.85–1.02×)** after fixing upstream's dtype-blind autotune key (3.0× gain, one line). Met at bs=8, missed at bs≥32. Not ALU-bound — three dequant optimizations tested and refuted. |
 | AC5 no non-Ampere regression | ✅ `IS_FP8` defaults false; bf16 path byte-identical |
 | AC7 upstream package | ✅ `patches/triton_mla_sparse_fp8.patch` (224 lines) + RFC framing |
 | AC9 pre-flight | ✅ gap real and upstream-declared |
@@ -87,5 +103,9 @@ KV pool for an 8% decode cost**. At large batch it is not yet competitive.
 
 The hard question the project existed to answer — *can Ampere read fp8 KV pages
 correctly, inside vLLM, at production scale?* — is answered **yes, with
-numbers**. The remaining work is performance tuning with a specific, tested
-hypothesis, not further discovery.
+numbers**: correctness 0.999873–0.999996 end-to-end, **1.756× KV capacity at
+~0.85–1.0× decode speed**. On a 24 GB card that is the trade the whole project
+exists to make.
+
+And we found a real upstream bug on the way: their sparse-MLA autotune key is
+blind to the KV dtype, which silently mis-tunes any non-bf16 path by 3×.

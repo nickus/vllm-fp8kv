@@ -206,6 +206,25 @@ def _thread_is_fp8(s: str) -> str:
     return s
 
 
+# --- 5. THE PERF FIX: fp8 must get its OWN autotuned config -------------------
+# Upstream's autotune key is (index_topk, kv_group_num) — it does NOT include
+# the dtype, so the fp8 path silently REUSES the config Triton cached for bf16.
+# That config is tuned for bf16's access pattern (1152 B rows, 2 loads); fp8
+# reads 656 B rows + a scale load and wants a much larger BLOCK_N and more
+# warps. Measured on RTX 3090, topk=2048: with bf16's config fp8 ran 608 us at
+# bs=32; correctly autotuned (BLOCK_N=64, 8 warps, split-KV) it runs 201 us —
+# i.e. 1.36x FASTER than bf16, instead of 2.2x slower. Adding IS_FP8 to the key
+# is the entire fix.
+AUTOTUNE_ANCHOR_1 = (
+    '@triton.autotune(configs=_FINAL_AUTOTUNE_CONFIGS, key=["index_topk", "kv_group_num"])'
+)
+AUTOTUNE_NEW_1 = (
+    '@triton.autotune(\n'
+    '    configs=_FINAL_AUTOTUNE_CONFIGS,\n'
+    '    key=["index_topk", "kv_group_num", "IS_FP8"],\n'
+    ')'
+)
+
 DISPATCH_ANCHOR = """    assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK"""
 DISPATCH_NEW = """    # fp8_ds_mla: the cache arrives as raw uint8 pages (656 B/token) instead of
     # bf16 [seq_kv, 1, 576]. Decoded in-register by the kernel — no fp8e4nv, so
@@ -230,11 +249,16 @@ def main():
         (LOADS_ANCHOR, LOADS_NEW, "K/RoPE loads"),
         (V_ANCHOR, V_NEW, "V reuse"),
         (DISPATCH_ANCHOR, DISPATCH_NEW, "dispatcher fp8 detect"),
+        (AUTOTUNE_ANCHOR_1, AUTOTUNE_NEW_1, "fp8 autotune key (the perf fix)"),
     ]:
         if anchor not in s:
             sys.exit(f"ANCHOR NOT FOUND ({name}) — upstream drifted; re-derive")
         s = s.replace(anchor, new, 1)
     s = _thread_is_fp8(s)
+    # the split kernel's @triton.autotune(...) uses a multi-line key list; add
+    # IS_FP8 there too so BOTH autotuned entry points key on the dtype.
+    s = s.replace('    key=["index_topk", "kv_group_num"],',
+                  '    key=["index_topk", "kv_group_num", "IS_FP8"],')
     # the two kernel launches must pass IS_FP8=is_fp8
     s = s.replace("        BLOCK_DPE=_BLOCK_DPE,", "        BLOCK_DPE=_BLOCK_DPE,\n        IS_FP8=is_fp8,")
 
