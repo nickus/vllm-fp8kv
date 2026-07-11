@@ -97,10 +97,15 @@ def _fp8_ds_mla_sparse_decode_kernel(
     index_topk: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    N_TILES: tl.constexpr,
     WRITE_LSE: tl.constexpr,
 ):
-    cur_q = tl.program_id(0)
-    cur_head_id = tl.program_id(1)
+    # int64: with h_q=128, stride_q_token=73728 -> cur_q * stride overflows
+    # int32 at ~29k tokens. Mixed-batch mode pushes every batched token through
+    # here, so max_num_batched_tokens >= 32k hits it. Same disease we already
+    # cured on the kv side; cure it here too.
+    cur_q = tl.program_id(1).to(tl.int64)
+    cur_head_id = tl.program_id(0)
     cur_kv_head_id = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
 
     VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
@@ -139,13 +144,18 @@ def _fp8_ds_mla_sparse_decode_kernel(
             mask=mask_kv[None, :], other=0,
         )                                                             # [NOPE, BLOCK_N] uint8
         kd = dequant_bitmath_triton(kb).to(tl.float32)                # exact fp8e4m3 -> fp32
-        # 4 x fp32 tile scales live at byte SCALE_OFF; element d belongs to tile d//128
+        # 4 x fp32 tile scales at byte SCALE_OFF. Load them as [N_TILES, BLOCK_N]
+        # (64 values), NOT as a [NOPE, BLOCK_N] gather: the latter is a 128x
+        # redundant load that Triton stages in smem as 32 KB/stage and blows
+        # sm_86's 100 KB cap. Broadcast over the tile via reshape instead.
+        offs_t = tl.arange(0, N_TILES)
         sc = tl.load(
             (kv_ptr + row[None, :] + SCALE_OFF).to(tl.pointer_type(tl.float32))
-            + (offs_d[:, None] // TILE),
+            + offs_t[:, None],
             mask=mask_kv[None, :], other=0.0,
-        )                                                             # [NOPE, BLOCK_N]
-        k_nope = (kd * sc).to(q_nope.dtype)                           # dequant = fp8 * scale
+        )                                                             # [N_TILES, BLOCK_N]
+        kd3 = tl.reshape(kd, (N_TILES, TILE, BLOCK_N))
+        k_nope = tl.reshape(kd3 * sc[:, None, :], (NOPE, BLOCK_N)).to(q_nope.dtype)
 
         # ---- RoPE: stored RAW bf16 (never quantized) at byte ROPE_OFF
         k_rope = tl.load(
@@ -159,9 +169,18 @@ def _fp8_ds_mla_sparse_decode_kernel(
         qk = tl.where(mask_h[:, None] & mask_kv[None, :], qk, -float("inf"))
 
         # ---- online softmax (exp2 form; sm_scale carries the log2(e) factor)
+        # NaN GUARD (load-bearing): a BLOCK_N chunk that is fully masked BEFORE
+        # any valid chunk leaves the running max at -inf, and exp2(-inf - -inf)
+        # = exp2(NaN) = NaN, which then permanently poisons acc — the later
+        # `e_sum > 0` guard cannot undo it. Fully-masked chunks are NOT exotic:
+        # upstream post-masks empty rows for exactly this reason
+        # (flashinfer_mla_sparse.py:523), and the DCP path emits interleaved -1s.
+        # Substituting 0.0 for a still--inf max is exact: acc stays 0, e_sum
+        # stays 0, LSE stays -inf.
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        re_scale = tl.exp2(e_max - n_e_max)
-        p = tl.exp2(qk - n_e_max[:, None])
+        safe_max = tl.where(n_e_max == -float("inf"), 0.0, n_e_max)
+        re_scale = tl.exp2(e_max - safe_max)
+        p = tl.exp2(qk - safe_max[:, None])
         acc *= re_scale[:, None]
 
         # MLA: V IS the NoPE half of the same rows — reuse, don't re-load.
@@ -171,7 +190,8 @@ def _fp8_ds_mla_sparse_decode_kernel(
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 
-    # rows that selected nothing: emit zeros, not NaN
+    # rows that selected nothing: emit zeros, not NaN (now actually true — see
+    # the NaN guard above; this alone was never sufficient)
     safe = e_sum > 0
     out = acc / tl.where(safe, e_sum, 1.0)[:, None]
     tl.store(
@@ -203,6 +223,15 @@ def fp8_ds_mla_sparse_decode(
     the block-table transform. Returns `out` [seq_q, h_q, 512] (+ lse).
     """
     assert kv_cache.dtype in (torch.uint8, torch.float8_e4m3fn), kv_cache.dtype
+    # reshape() on a non-contiguous pool would silently COPY the whole cache
+    # every call; and the kernel hard-assumes unit last-dim strides.
+    assert kv_cache.is_contiguous(), "kv_cache must be contiguous"
+    assert q.stride(-1) == 1 and indices.stride(-1) == 1, "need unit last-dim strides"
+    # rope is bitcast as bf16 (the writer stores it as the model dtype); an fp16
+    # model would make that bitcast read garbage. Also keeps us clear of the
+    # Triton-3.6 fp16 tl.dot miscompile on RTX 3090 (triton #9830).
+    assert q.dtype == torch.bfloat16, f"rope is stored bf16; q must be bf16, got {q.dtype}"
+
     kv_u8 = kv_cache.view(torch.uint8).reshape(-1, ROW_BYTES)
     num_slots = kv_u8.shape[0]
 
@@ -211,12 +240,16 @@ def fp8_ds_mla_sparse_decode(
     if indices.dim() == 2:
         indices = indices.unsqueeze(1)          # [seq_q, 1, topk]
     kv_groups, topk = indices.shape[1], indices.shape[2]
+    assert h_q % kv_groups == 0, f"h_q={h_q} not divisible by kv_groups={kv_groups}"
 
     out = torch.empty((seq_q, h_q, NOPE), dtype=q.dtype, device=q.device)
     lse = torch.empty((seq_q, h_q), dtype=torch.float32, device=q.device)
 
     kv_group_num = h_q // kv_groups
-    grid = (seq_q, triton.cdiv(kv_group_num, block_h) * kv_groups)
+    # grid axis 0 = head-blocks so that sibling CTAs (same token, different
+    # heads) launch adjacently and re-hit the same gathered KV rows in L2;
+    # the reverse order re-streams ~1.3 MB per head-block from HBM.
+    grid = (triton.cdiv(kv_group_num, block_h) * kv_groups, seq_q)
 
     _fp8_ds_mla_sparse_decode_kernel[grid](
         q, kv_u8, indices, out, lse,
@@ -231,6 +264,7 @@ def fp8_ds_mla_sparse_decode(
         index_topk=topk,
         BLOCK_H=block_h,
         BLOCK_N=block_n,
+        N_TILES=NOPE // TILE,
         WRITE_LSE=return_lse,
         num_stages=num_stages,
         num_warps=num_warps,

@@ -3,8 +3,9 @@
 """One-command verification: `python verify/run_all.py`.
 
 Model-free. Exercises the fp8_ds_mla decode kernel against fp32 golden
-references over the shape matrix + the traps that bit dsa-3090 (int32 slot
-overflow, masked/-1 slots, empty rows, NaN bytes, page-boundary crossing).
+references over the shape matrix + the traps (int32 slot overflow, masked/-1
+slots, LEADING-masked chunks -> NaN poisoning, empty rows, the real 3D paged
+cache shape, LSE).
 
 Exit code = number of failed checks.
 """
@@ -103,6 +104,39 @@ def section_decode(rep, device):
     out = fp8_ds_mla_sparse_decode(q, packed, idx, sm)
     rep.check("decode/empty-selection-is-zero", bool(out.isfinite().all() and (out == 0).all()),
               "all-masked rows -> zeros, no NaN")
+
+    # trap: a LEADING run of -1 (fully-masked chunks before any valid one) is
+    # what makes exp2(-inf - -inf) = NaN and poisons acc permanently. Upstream
+    # hits this (DCP emits interleaved -1s); the naive online-softmax does NOT
+    # survive it. Separate check because a NaN here is invisible in cosine.
+    packed, _ = _rand_kv(512, seed=13, device=device)
+    q = torch.randn(1, 16, 576, device=device, dtype=torch.bfloat16) * 0.5
+    idx = torch.full((1, 64), -1, dtype=torch.int32, device=device)
+    idx[0, 48:] = torch.arange(16, dtype=torch.int32, device=device)   # valid only at the END
+    out = fp8_ds_mla_sparse_decode(q, packed, idx, sm)
+    ref = R.ref_sparse_mla_decode(q, packed, idx, sm)
+    finite = bool(out.isfinite().all())
+    c = cosine(out.float(), ref) if finite else 0.0
+    rep.check("decode/leading-masked-chunks-no-nan", finite and c > 0.999,
+              f"finite={finite} cosine={c:.6f} (48 leading -1s then valid slots)")
+
+    # the real cache is 3D [num_blocks, block_size, 656] — exercise the reshape
+    # path, not just the flat view the other tests pass
+    packed3d = packed.reshape(8, 64, 656)
+    idx = torch.randint(0, 512, (1, 32), dtype=torch.int32, device=device)
+    out3 = fp8_ds_mla_sparse_decode(q, packed3d, idx, sm)
+    ref3 = R.ref_sparse_mla_decode(q, packed, idx, sm)
+    c = cosine(out3.float(), ref3)
+    rep.check("decode/paged-3d-cache-shape", c > 0.999, f"cosine={c:.6f} ([8,64,656] pool)")
+
+    # LSE: never exercised before — the WRITE_LSE branch did not even compile
+    out4, lse = fp8_ds_mla_sparse_decode(q, packed, idx, sm, return_lse=True)
+    kv = R.ref_dequant_fp8_ds_mla_row(packed).float()
+    sel = idx[0][(idx[0] >= 0)].long()
+    scores = (q[0].float() @ kv[sel].T) * sm
+    lse_ref = torch.logsumexp(scores, dim=-1)
+    m = max_abs(lse[0], lse_ref)
+    rep.check("decode/lse-matches-logsumexp", m < 5e-2, f"max_abs={m:.2e} (natural-log LSE)")
 
 
 def section_bigpool(rep, device):
