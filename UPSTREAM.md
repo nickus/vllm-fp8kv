@@ -1,15 +1,18 @@
 # Upstream package
 
-> **REWRITTEN 2026-07-11** after the adversarial audit
+## Filed
+
+| # | What | Status |
+|---|---|---|
+| [#48364](https://github.com/vllm-project/vllm/issues/48364) | **Bug:** fully-masked leading index chunks NaN-poison `xpu_mla_sparse` (`exp2(-inf − -inf)`), silently corrupting attention output for any row whose first 16 topk entries are all masked | filed |
+| [#48366](https://github.com/vllm-project/vllm/pull/48366) | **Fix PR:** finite sentinel + regression test; verified bidirectionally (fails on the unfixed kernel, passes on the fixed one) | filed |
+| [#48374](https://github.com/vllm-project/vllm/issues/48374) | **RFC:** fp8 KV cache for the Ampere sparse-MLA path via software dequant — with the honest 0.92×/0.45× decode table and the two open items (backend wiring, engine boot) stated up front | filed |
+
+> **Rewritten 2026-07-11** after the adversarial audit
 > ([REVIEW-2026-07-11.md](REVIEW-2026-07-11.md)). The previous version of this
-> file contained two contributions; #1 was **withdrawn before filing** — its
-> central mechanism is false — and #2 is **held until re-measurement**. What
-> HAS been filed from this program so far:
->
-> * vLLM issue [#48364](https://github.com/vllm-project/vllm/issues/48364) +
->   PR [#48366](https://github.com/vllm-project/vllm/pull/48366) — NaN
->   poisoning in `xpu_mla_sparse` for fully-masked leading index chunks
->   (2-line finite-sentinel fix + regression test, verified bidirectionally).
+> file proposed a second contribution — a "dtype-blind autotune key" bug report
+> — which was **withdrawn before filing: its central mechanism is false.** See
+> below.
 
 ---
 
@@ -35,7 +38,7 @@ real kernel as of this writing.
 
 ---
 
-## Held: fp8 KV cache on sm_80 / sm_86 (`fp8_ds_mla`) — RFC after re-measurement
+## Filed: fp8 KV cache on sm_80 / sm_86 (`fp8_ds_mla`) — RFC #48374
 
 **Patch:** `patches/triton_mla_sparse_fp8.patch` (224 lines; one flag, one
 branch, one dispatcher arg). Regenerates **byte-identically** from
@@ -86,21 +89,25 @@ PR*; our contribution extends it to the KV path.
 * Slot offsets are computed in **int64**: `slot × 656` exceeds int32 past
   ~3.3 M slots, which a 24 GB fp8 pool reaches.
 
-### What must happen before filing the RFC
+### What the RFC states honestly (and what is still open)
 
-1. **Re-measure decode speed** fp8-vs-bf16 *within the patched upstream
-   kernel* (its own split-KV + LSE merge), including whether extending the
-   autotune config lists closes the current 0.45–0.92× gap. Never cite the
-   retracted parity table.
-2. **Boot a vLLM engine** with `--kv-cache-dtype fp8_e4m3` through
-   `vllm_fp8kv.backend_patch` (now covers `get_kv_cache_shape` + dtype
-   canonicalization) and compare logits vs a bf16 run — engine-level AC1.
-3. Decide the RFC's scope: kernel-only (patch as-is, backend wiring as a
-   follow-up) or kernel+backend (fold the `backend_patch.py` logic into the
-   diff). State it explicitly either way.
-4. Correctness claims: cite **0.999996** (writer-roundtrip chain) only.
-5. Non-Ampere regression: state as a *static* argument (`IS_FP8` defaults
-   False; bf16 branch source-identical), not as tested.
+The RFC leads with the decode cost rather than burying it: **0.92× at bs=8,
+0.45× at bs=32** vs bf16 on the same kernel — a capacity-for-speed trade, not a
+free win. The config-list hypothesis (upstream's `BLOCK_N=16/32`-only autotune
+lists are bf16-shaped) is flagged **as a hypothesis, not a finding**, because it
+has not been measured on the real kernel.
+
+Open items, both stated in the RFC:
+
+1. **Backend wiring** — the shipped patch is kernel-only and inert alone
+   (`supported_kv_cache_dtypes`, the 656-B `get_kv_cache_shape`, and
+   `_canonicalize_sparse_mla_kv_cache_dtype`). Working out-of-tree in
+   `vllm_fp8kv/backend_patch.py` (~40 lines, now tested).
+2. **Engine boot** — no `LLM(kv_cache_dtype="fp8_e4m3")` run yet; all
+   correctness is kernel-level (0.999996 through vLLM's own writer + converter).
+
+Both are gated on the next GPU session, and on upstream saying the feature is
+wanted at all.
 
 ### Provenance
 

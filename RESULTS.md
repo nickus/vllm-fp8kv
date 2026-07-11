@@ -107,7 +107,7 @@ exercises two of the five variants, so this too is anecdote, not evidence.
 | AC2 pool ≥1.9× | ❌ as written (target exceeds the format ceiling). Format arithmetic: **1.756×**; effective engine-level ≈1.63× incl. indexer cache |
 | AC3 speed ≥95%/100% | ❌ **0.92× (bs=8) / 0.45× (bs=32)** on the real patched kernel; parity claim retracted; config-tuning hypothesis unmeasured |
 | AC5 no non-Ampere regression | ◻ argued statically (`IS_FP8` defaults False, bf16 branch source-identical) — **never tested on non-Ampere hardware** |
-| AC7 upstream package | ⚠️ patch (224 lines) regenerates byte-identically and apply-checks vs `bbe2ab4d6`; RFC held back pending re-measurement (see UPSTREAM.md) |
+| AC7 upstream package | ✅ 3 filed: vLLM [#48364](https://github.com/vllm-project/vllm/issues/48364) + [#48366](https://github.com/vllm-project/vllm/pull/48366) (NaN bug + fix PR), [#48374](https://github.com/vllm-project/vllm/issues/48374) (fp8-KV RFC, honest 0.92×/0.45× table). Patch (224 lines) regenerates byte-identically and apply-checks vs `bbe2ab4d6` |
 | AC9 pre-flight | ✅ gap real and upstream-declared |
 | AC4 (TP+DP+PP+MTP+graph), AC6 (128K), AC8 | not reached |
 
