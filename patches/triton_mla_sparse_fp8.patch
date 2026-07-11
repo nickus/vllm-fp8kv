@@ -1,0 +1,224 @@
+diff --git a/vllm/v1/attention/ops/triton_mla_sparse_kernel.py b/vllm/v1/attention/ops/triton_mla_sparse_kernel.py
+index 0654c019a..54f547942 100644
+--- a/vllm/v1/attention/ops/triton_mla_sparse_kernel.py
++++ b/vllm/v1/attention/ops/triton_mla_sparse_kernel.py
+@@ -9,6 +9,36 @@ import torch
+ from vllm.triton_utils import LOG2E, LOGE2, tl, triton
+ from vllm.utils.platform_utils import num_compute_units
+ 
++# fp8_ds_mla page geometry (csrc/libtorch_stable/cache_kernels.cu:446):
++#   [   0 : 512 )  512 x fp8e4m3  NoPE latent
++#   [ 512 : 528 )    4 x fp32     per-128-element tile scales (amax / 448)
++#   [ 528 : 656 )   64 x bf16     RoPE, stored RAW (never quantized)
++# tl.constexpr so the @triton.jit bodies below can read them (Triton forbids
++# plain module globals inside kernels).
++_FP8_ROW_BYTES = tl.constexpr(656)
++_FP8_SCALE_OFF = tl.constexpr(512)
++_FP8_ROPE_OFF = tl.constexpr(528)
++_FP8_TILE = tl.constexpr(128)
++_FP8_N_TILES = tl.constexpr(4)
++_FP8_ROW_BYTES_PY = 656   # plain int for host-side shape math
++
++
++@triton.jit
++def _decode_fp8e4m3(b):
++    """fp8e4m3fn bytes -> fp16, in-register, without Triton's fp8e4nv.
++
++    The fp8 payload dropped into the fp16 bit layout is off by a fixed 2^8 for
++    normals AND denormals alike, so one bitcast + one exact fp16 multiply
++    decodes it; 0x7F/0xFF (fp8e4m3*fn* has no inf) are NaN and need a select.
++    Bit-exact vs torch.float8_e4m3fn over all 256 byte values.
++    """
++    u = b.to(tl.uint16)
++    sgn = (u & 0x80) << 8
++    mag = (u & 0x7F) << 7
++    val = (sgn | mag).to(tl.float16, bitcast=True) * 256.0
++    nan = (sgn | 0x7F80).to(tl.float16, bitcast=True)
++    return tl.where((u & 0x7F) == 0x7F, nan, val.to(tl.float16))
++
+ # DeepSeek-V3.2 / GLM-5 sparse MLA shape constants.
+ _BLOCK_DMODEL = 512
+ _BLOCK_DPE = 64
+@@ -69,9 +99,14 @@ def _sparse_mla_compute_tile(
+     BLOCK_DV: tl.constexpr,
+     BLOCK_DMODEL: tl.constexpr,
+     BLOCK_DPE: tl.constexpr,
++    IS_FP8: tl.constexpr = False,
+ ):
+     """Shared stage-1 body: load Q, run the sparse online-softmax loop over
+-    `[split_start, split_end)` of the topk axis, return accumulators."""
++    `[split_start, split_end)` of the topk axis, return accumulators.
++
++    With IS_FP8, `k_buffer` is the standard `fp8_ds_mla` cache as raw uint8
++    (656 B/token) and is decoded in-register — no fp8e4nv conversion, so this
++    path compiles and runs on sm_80/sm_86 where native fp8 does not exist."""
+     offs_d = tl.arange(0, BLOCK_DMODEL)
+     offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+     offs_dv = tl.arange(0, BLOCK_DV)
+@@ -115,35 +150,76 @@ def _sparse_mla_compute_tile(
+         )
+         mask_kv = (indices >= 0) & (indices < seq_kv)
+ 
+-        offs_k = (
+-            indices[None, :] * stride_kv_token
+-            + cur_kv_head_id * stride_kv_head
+-            + offs_d[:, None]
+-        )
+-        k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
+-        qk = tl.dot(q, k.to(q.dtype))
+-
+-        offs_kpe = (
+-            indices[None, :] * stride_kv_token
+-            + cur_kv_head_id * stride_kv_head
+-            + offs_dpe[:, None]
+-        )
+-        kpe = tl.load(
+-            k_buffer + offs_kpe,
+-            mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
+-            other=0.0,
+-        )
+-        qk += tl.dot(qpe, kpe.to(q.dtype))
++        if IS_FP8:
++            # int64: slot * 656 exceeds int32 past ~3.3M slots, which a 24 GB
++            # fp8 pool reaches (26 M tokens/16 GiB).
++            row = indices.to(tl.int64) * _FP8_ROW_BYTES
++            kb = tl.load(
++                k_buffer + row[None, :] + offs_d[:, None],
++                mask=mask_kv[None, :],
++                other=0,
++            )
++            kd = _decode_fp8e4m3(kb).to(tl.float32)
++            # 4 fp32 tile scales per row; broadcast over the 128-element tile
++            # (gathering them per-element would stage 32 KB/stage of smem and
++            # blow sm_86's 100 KB cap).
++            sc = tl.load(
++                (k_buffer + row[None, :] + _FP8_SCALE_OFF).to(
++                    tl.pointer_type(tl.float32)
++                )
++                + tl.arange(0, _FP8_N_TILES)[:, None],
++                mask=mask_kv[None, :],
++                other=0.0,
++            )
++            kd3 = tl.reshape(kd, (_FP8_N_TILES, _FP8_TILE, BLOCK_N))
++            k = tl.reshape(kd3 * sc[:, None, :], (BLOCK_DMODEL, BLOCK_N)).to(q.dtype)
++            qk = tl.dot(q, k)
++
++            # RoPE half is stored RAW bf16 — never quantized, never scaled
++            kpe = tl.load(
++                (k_buffer + row[None, :] + _FP8_ROPE_OFF).to(
++                    tl.pointer_type(tl.bfloat16)
++                )
++                + tl.arange(0, BLOCK_DPE)[:, None],
++                mask=mask_kv[None, :],
++                other=0.0,
++            ).to(q.dtype)
++            qk += tl.dot(qpe, kpe)
++        else:
++            offs_k = (
++                indices[None, :] * stride_kv_token
++                + cur_kv_head_id * stride_kv_head
++                + offs_d[:, None]
++            )
++            k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
++            qk = tl.dot(q, k.to(q.dtype))
++
++            offs_kpe = (
++                indices[None, :] * stride_kv_token
++                + cur_kv_head_id * stride_kv_head
++                + offs_dpe[:, None]
++            )
++            kpe = tl.load(
++                k_buffer + offs_kpe,
++                mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
++                other=0.0,
++            )
++            qk += tl.dot(qpe, kpe.to(q.dtype))
+ 
+         qk *= sm_scale
+         qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
+ 
+-        offs_v = (
+-            indices[:, None] * stride_kv_token
+-            + cur_kv_head_id * stride_kv_head
+-            + offs_dv[None, :]
+-        )
+-        v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
++        if IS_FP8:
++            # MLA: V IS the NoPE half of the same rows — reuse the block we
++            # already decoded instead of re-reading and re-decoding it.
++            v = tl.trans(k)
++        else:
++            offs_v = (
++                indices[:, None] * stride_kv_token
++                + cur_kv_head_id * stride_kv_head
++                + offs_dv[None, :]
++            )
++            v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
+ 
+         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+         re_scale = tl.exp2(e_max - n_e_max)
+@@ -181,6 +257,7 @@ def _sparse_mla_kernel_final(
+     BLOCK_DV: tl.constexpr,
+     BLOCK_DMODEL: tl.constexpr,
+     BLOCK_DPE: tl.constexpr,
++    IS_FP8: tl.constexpr,
+ ):
+     """Single-pass fast path: full topk, write final bf16 output directly."""
+     cur_q = tl.program_id(0)
+@@ -214,6 +291,7 @@ def _sparse_mla_kernel_final(
+         BLOCK_DV,
+         BLOCK_DMODEL,
+         BLOCK_DPE,
++        IS_FP8,
+     )
+ 
+     # Guard against queries with zero valid KV (e_sum == 0 → NaN from 0/0).
+@@ -259,6 +337,7 @@ def _sparse_mla_kernel_split(
+     BLOCK_DV: tl.constexpr,
+     BLOCK_DMODEL: tl.constexpr,
+     BLOCK_DPE: tl.constexpr,
++    IS_FP8: tl.constexpr,
+     LOGE2: tl.constexpr,
+ ):
+     """Stage 1 of split-KV: process one slice of the topk axis and write
+@@ -299,6 +378,7 @@ def _sparse_mla_kernel_split(
+         BLOCK_DV,
+         BLOCK_DMODEL,
+         BLOCK_DPE,
++        IS_FP8,
+     )
+ 
+     # Partial output and natural-log LSE for stage-2 merge.
+@@ -449,7 +529,15 @@ def triton_mla_sparse_attention(
+         f"sparse MLA kernel requires dim_qk={_DIM_QK} (DeepSeek-V3.2 / GLM-5), "
+         f"got {dim_qk}"
+     )
+-    assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK
++    # fp8_ds_mla: the cache arrives as raw uint8 pages (656 B/token) instead of
++    # bf16 [seq_kv, 1, 576]. Decoded in-register by the kernel — no fp8e4nv, so
++    # this works on sm_80/sm_86 where native fp8 conversion does not exist.
++    is_fp8 = kv.dtype in (torch.uint8, torch.float8_e4m3fn)
++    if is_fp8:
++        kv = kv.view(torch.uint8).reshape(-1, 1, _FP8_ROW_BYTES_PY)
++        assert kv.shape[2] == _FP8_ROW_BYTES_PY
++    else:
++        assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK
+     index_topk = indices.shape[2]
+     assert index_topk % _MIN_BLOCK_N == 0, (
+         f"topk ({index_topk}) must be a multiple of the smallest autotune "
+@@ -495,6 +583,7 @@ def triton_mla_sparse_attention(
+             BLOCK_DV=_BLOCK_DV,
+             BLOCK_DMODEL=_BLOCK_DMODEL,
+             BLOCK_DPE=_BLOCK_DPE,
++        IS_FP8=is_fp8,
+         )
+         return out
+ 
+@@ -528,6 +617,7 @@ def triton_mla_sparse_attention(
+         BLOCK_DV=_BLOCK_DV,
+         BLOCK_DMODEL=_BLOCK_DMODEL,
+         BLOCK_DPE=_BLOCK_DPE,
++        IS_FP8=is_fp8,
+         LOGE2=LOGE2,
+     )
+ 
