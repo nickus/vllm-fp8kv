@@ -2,3 +2,5 @@
 .venv-py
 __pycache__/
 *.pyc
+.venv-test/
+.coverage

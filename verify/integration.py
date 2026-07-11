@@ -20,9 +20,16 @@ Requires: vLLM with PR #47629 (triton_mla_sparse.py) importable.
 Run:  python verify/integration.py
 """
 
+import os
 import sys
 
 import torch
+
+# No GPU? Run the Triton kernels in the interpreter so this harness still
+# verifies the MATH in CI. (Only throughput and the bf16 dtype need hardware:
+# the interpreter stores bf16 as raw uint16 and cannot do bf16 arithmetic.)
+if not torch.cuda.is_available():
+    os.environ.setdefault("TRITON_INTERPRET", "1")
 
 sys.path.insert(0, __file__.rsplit("/", 2)[0])
 
@@ -32,7 +39,9 @@ from verify.metrics import Report, cosine, max_abs  # noqa: E402
 
 def main():
     rep = Report()
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # see verify/contract.py: bf16 arithmetic is GPU-only under Triton
+    q_dtype = torch.bfloat16 if device == "cuda" else torch.float32
     print("== vllm-fp8kv INTEGRATION (real TRITON_MLA_SPARSE call chain) ==")
 
     try:
@@ -96,7 +105,7 @@ def main():
 
     from vllm_fp8kv.fp8_ds_mla_sparse_decode import fp8_ds_mla_sparse_decode
 
-    q = (torch.randn(n_tokens, 16, 576, generator=g) * 0.5).to(device).to(torch.bfloat16)
+    q = (torch.randn(n_tokens, 16, 576, generator=g) * 0.5).to(device).to(q_dtype)
     sm = 1.0 / (576 ** 0.5)
     out = fp8_ds_mla_sparse_decode(q, cache, glob, sm)
     ref = R.ref_sparse_mla_decode(q, cache.reshape(-1, 656), glob, sm)
@@ -117,7 +126,9 @@ def main():
     else:
         import inspect
         src = inspect.getsource(triton_mla_sparse_attention)
-        if "is_fp8" not in src:
+        # match the DISPATCH STATEMENT, not the word: a mere mention of "is_fp8"
+        # in a comment or docstring must not be mistaken for a patched runtime.
+        if "is_fp8 = kv.dtype" not in src:
             rep.check("integration/patched-upstream-kernel", False,
                       "runtime kernel is UNPATCHED (no is_fp8 dispatch) — apply "
                       "patches/triton_mla_sparse_fp8.patch to site-packages, not "

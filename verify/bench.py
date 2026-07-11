@@ -27,9 +27,30 @@ from verify import reference as R  # noqa: E402
 from vllm_fp8kv.fp8_ds_mla_sparse_decode import fp8_ds_mla_sparse_decode  # noqa: E402
 
 FP8_ROW, BF16_ROW = 656, 576 * 2
+# The DSA indexer keeps its OWN K-cache (~132 B/token, same dtype in both
+# configs). It does not shrink with the main KV, so it dilutes the pool gain an
+# engine actually sees.
+INDEXER_ROW = 132
 
 
-def timeit(fn, iters=50, warmup=10):
+def kv_pool_tokens(pool_bytes: int) -> tuple[int, int, float]:
+    """(bf16 tokens, fp8 tokens, ratio) for a KV pool of `pool_bytes`.
+
+    The ratio is FORMAT ARITHMETIC, not a measurement: no engine allocated this.
+    """
+    return pool_bytes // BF16_ROW, pool_bytes // FP8_ROW, BF16_ROW / FP8_ROW
+
+
+def effective_pool_ratio(indexer_row: int = INDEXER_ROW) -> float:
+    """The capacity gain including the indexer K-cache, which fp8 does not shrink.
+
+    This is the number an engine sees (~1.63x), not the 1.756x of the KV row
+    alone. RESULTS.md quotes both; this function is what makes them checkable.
+    """
+    return (BF16_ROW + indexer_row) / (FP8_ROW + indexer_row)
+
+
+def timeit(fn, iters=50, warmup=10):  # pragma: no cover - GPU event timing
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -42,7 +63,7 @@ def timeit(fn, iters=50, warmup=10):
     return s.elapsed_time(e) / iters * 1e-3
 
 
-def bf16_sparse_decode(q, kv_bf16, indices, sm_scale):
+def bf16_sparse_decode(q, kv_bf16, indices, sm_scale):  # pragma: no cover - GPU baseline
     """Upstream's own bf16 sparse-MLA decode kernel (the thing we must beat)."""
     from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
         triton_mla_sparse_attention,
@@ -55,7 +76,7 @@ def bf16_sparse_decode(q, kv_bf16, indices, sm_scale):
     return out[:, : q.shape[1], :]
 
 
-def main():
+def main():  # pragma: no cover - GPU benchmark
     dev = "cuda"
     p = torch.cuda.get_device_properties(0)
     print(f"== vllm-fp8kv BENCH == {p.name} sm_{p.major}{p.minor} "
@@ -63,13 +84,13 @@ def main():
 
     # ---------- AC2: pool capacity ----------
     print("\n-- AC2: KV pool capacity (bytes/token) --")
-    ratio = BF16_ROW / FP8_ROW
     for gb in (16, 20):
-        b = gb * 2**30
-        print(f"  {gb} GiB pool: bf16 {b//BF16_ROW/1e6:.2f}M tokens | "
-              f"fp8 {b//FP8_ROW/1e6:.2f}M tokens")
-    print(f"  RATIO = {BF16_ROW}/{FP8_ROW} = {ratio:.3f}x  "
+        bf16_tok, fp8_tok, ratio = kv_pool_tokens(gb * 2**30)
+        print(f"  {gb} GiB pool: bf16 {bf16_tok/1e6:.2f}M tokens | "
+              f"fp8 {fp8_tok/1e6:.2f}M tokens")
+    print(f"  RATIO = {BF16_ROW}/{FP8_ROW} = {BF16_ROW/FP8_ROW:.3f}x  "
           f"(format ceiling; 656 B = 512 fp8 + 16 scale + 128 raw-bf16 rope)")
+    print(f"  EFFECTIVE (incl. indexer K-cache) = {effective_pool_ratio():.3f}x")
 
     # ---------- AC3: decode throughput ----------
     print("\n-- AC3: decode throughput, fp8 vs upstream bf16 --")

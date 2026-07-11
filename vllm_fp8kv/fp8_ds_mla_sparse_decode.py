@@ -236,7 +236,12 @@ def fp8_ds_mla_sparse_decode(
     # rope is bitcast as bf16 (the writer stores it as the model dtype); an fp16
     # model would make that bitcast read garbage. Also keeps us clear of the
     # Triton-3.6 fp16 tl.dot miscompile on RTX 3090 (triton #9830).
-    assert q.dtype == torch.bfloat16, f"rope is stored bf16; q must be bf16, got {q.dtype}"
+    # fp32 is additionally allowed: it is numerically safe (bf16 rope widens to
+    # fp32 exactly) and it is the only dtype the CPU Triton interpreter can do
+    # arithmetic in, which is what makes this kernel testable without a GPU.
+    assert q.dtype in (torch.bfloat16, torch.float32), (
+        f"rope is stored bf16; q must be bf16 (fp32 allowed for testing), got {q.dtype}"
+    )
 
     kv_u8 = kv_cache.view(torch.uint8).reshape(-1, ROW_BYTES)
     num_slots = kv_u8.shape[0]

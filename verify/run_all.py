@@ -10,9 +10,16 @@ cache shape, LSE).
 Exit code = number of failed checks.
 """
 
+import os
 import sys
 
 import torch
+
+# No GPU? Run the Triton kernels in the interpreter so this harness still
+# verifies the MATH in CI. (Only throughput and the bf16 dtype need hardware:
+# the interpreter stores bf16 as raw uint16 and cannot do bf16 arithmetic.)
+if not torch.cuda.is_available():
+    os.environ.setdefault("TRITON_INTERPRET", "1")
 
 sys.path.insert(0, __file__.rsplit("/", 2)[0])
 
@@ -69,22 +76,28 @@ def section_layout(rep, device):
 
 
 def section_decode(rep, device):
-    if device != "cuda":
-        rep.skip("decode/*", "no GPU")
-        return
+    """Decode correctness. Runs on CPU too (Triton interpreter) at reduced
+    shapes: the math is identical, only throughput and the bf16 dtype need a
+    GPU (the interpreter stores bf16 as raw uint16 and cannot do bf16 dots)."""
     from vllm_fp8kv.fp8_ds_mla_sparse_decode import fp8_ds_mla_sparse_decode
 
+    gpu = device == "cuda"
+    dt = torch.bfloat16 if gpu else torch.float32
     sm = 1.0 / (576 ** 0.5)
     # matrix: (seq_q, h_q, n_slots, topk)
-    for seq_q, h_q, n_slots, topk in [
+    shapes = [
         (1, 16, 512, 64),        # single-token decode, small
         (4, 16, 4096, 256),      # batch
         (1, 128, 8192, 512),     # many heads (GLM: 128 q-heads before TP)
         (8, 16, 65536, 2048),    # GLM index_topk=2048 at 64K-slot pool
-    ]:
+    ] if gpu else [
+        (1, 16, 128, 32),        # CPU: same code paths, interpreter-sized
+        (2, 16, 256, 64),
+    ]
+    for seq_q, h_q, n_slots, topk in shapes:
         packed, _ = _rand_kv(n_slots, seed=seq_q + h_q, device=device)
         g = torch.Generator(device="cpu").manual_seed(topk)
-        q = (torch.randn(seq_q, h_q, 576, generator=g) * 0.5).to(device).to(torch.bfloat16)
+        q = (torch.randn(seq_q, h_q, 576, generator=g) * 0.5).to(device).to(dt)
         # random slots, with -1 sentinels sprinkled in (masked slots trap)
         idx = torch.randint(0, n_slots, (seq_q, topk), generator=g).to(device).int()
         idx[:, ::7] = -1
@@ -99,7 +112,7 @@ def section_decode(rep, device):
 
     # trap: a row that selects NOTHING must yield zeros, not NaN
     packed, _ = _rand_kv(256, seed=99, device=device)
-    q = torch.randn(2, 16, 576, device=device, dtype=torch.bfloat16) * 0.5
+    q = torch.randn(2, 16, 576, device=device, dtype=dt) * 0.5
     idx = torch.full((2, 32), -1, dtype=torch.int32, device=device)
     out = fp8_ds_mla_sparse_decode(q, packed, idx, sm)
     rep.check("decode/empty-selection-is-zero", bool(out.isfinite().all() and (out == 0).all()),
@@ -110,7 +123,7 @@ def section_decode(rep, device):
     # hits this (DCP emits interleaved -1s); the naive online-softmax does NOT
     # survive it. Separate check because a NaN here is invisible in cosine.
     packed, _ = _rand_kv(512, seed=13, device=device)
-    q = torch.randn(1, 16, 576, device=device, dtype=torch.bfloat16) * 0.5
+    q = torch.randn(1, 16, 576, device=device, dtype=dt) * 0.5
     idx = torch.full((1, 64), -1, dtype=torch.int32, device=device)
     idx[0, 48:] = torch.arange(16, dtype=torch.int32, device=device)   # valid only at the END
     out = fp8_ds_mla_sparse_decode(q, packed, idx, sm)
@@ -143,6 +156,8 @@ def section_bigpool(rep, device):
     """int32 slot-offset overflow: slot*656 exceeds 2^31 past ~3.27M slots.
     dsa-3090 shipped this bug once (illegal access at capacity scale)."""
     if device != "cuda":
+        # a 2.3 GB pool is not a CPU test; the int64 offset math it guards is
+        # covered by tests/test_sparse_decode.py at every other level
         rep.skip("bigpool/int64-offsets", "no GPU")
         return
     from vllm_fp8kv.fp8_ds_mla_sparse_decode import fp8_ds_mla_sparse_decode

@@ -82,13 +82,17 @@ def _wrap(target_cls, out_path: str):
             for k, v in kwargs.items():
                 if torch.is_tensor(v):
                     rec[k] = v.detach().cpu()
-            # the topk indices are the int tensor with a topk-sized last dim
-            for k, v in list(rec.items()):
+            # the topk indices are the int tensor with a topk-sized last dim.
+            # NB: iterate over a SNAPSHOT of the tensors — the loops below add
+            # non-tensor keys ("indices_from") to rec, and a later `v.dtype`
+            # over them raises AttributeError.
+            tensors = [(k, v) for k, v in rec.items() if torch.is_tensor(v)]
+            for k, v in tensors:
                 if v.dtype in (torch.int32, torch.int64) and v.dim() >= 2 and v.shape[-1] >= 64:
                     rec["indices"] = v
                     rec["indices_from"] = k
             # cache geometry, so we can tell flat-slot from token indices
-            for k, v in list(rec.items()):
+            for k, v in tensors:
                 if v.dtype == torch.uint8 and v.dim() >= 2:
                     rec["num_slots"] = int(v.shape[0] * (v.shape[1] if v.dim() > 2 else 1))
             CAPTURED.update(rec)

@@ -27,9 +27,16 @@ from vLLM at runtime:
 Run on a box with vLLM installed:  python verify/contract.py
 """
 
+import os
 import sys
 
 import torch
+
+# No GPU? Run the Triton kernels in the interpreter so this harness still
+# verifies the MATH in CI. (Only throughput and the bf16 dtype need hardware:
+# the interpreter stores bf16 as raw uint16 and cannot do bf16 arithmetic.)
+if not torch.cuda.is_available():
+    os.environ.setdefault("TRITON_INTERPRET", "1")
 
 sys.path.insert(0, __file__.rsplit("/", 2)[0])
 
@@ -144,7 +151,10 @@ def check_writer_roundtrip(rep: Report, device="cuda"):
               f"correctly IGNORED by the ds_mla writer)")
 
     # end-to-end: our decode over pages written by THEIR writer
-    q = (torch.randn(4, 16, 576, generator=g) * 0.5).to(device).to(torch.bfloat16)
+    # bf16 on GPU (the production dtype); fp32 on CPU, where the Triton
+    # interpreter stores bf16 as raw uint16 and cannot do bf16 arithmetic.
+    q_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    q = (torch.randn(4, 16, 576, generator=g) * 0.5).to(device).to(q_dtype)
     idx = torch.randint(0, n, (4, 32), generator=g).to(device).int()
     sm = 1.0 / (576 ** 0.5)
     out = K.fp8_ds_mla_sparse_decode(q, cache, idx, sm)
@@ -186,10 +196,9 @@ def main():
     print(f"== vllm-fp8kv CONTRACT tests (vs vLLM itself) == device={device}")
     rep = Report()
     check_layout_contract(rep)
-    if device == "cuda":
-        check_writer_roundtrip(rep, device)
-    else:
-        rep.skip("contract/writer-roundtrip", "no GPU")
+    # runs on CPU too: the writer is vLLM's, but the roundtrip and the offset
+    # canaries are plain tensor math, and the decode falls back to fp32 q.
+    check_writer_roundtrip(rep, device)
     check_indices_contract(rep)
     print(f"== done: {rep.failed} failure(s) ==")
     sys.exit(min(rep.failed, 125))
