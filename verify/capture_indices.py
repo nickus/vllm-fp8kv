@@ -16,8 +16,14 @@ Usage (on a box with vLLM + a DSA model):
     python verify/capture_indices.py --model <toy-or-real-glm-dsa> \
         [--out /root/idx_trace.pt]
 
-Works with whichever sparse-MLA backend the platform selects; we hook the
-generic MLA sparse impl rather than one concrete backend.
+The hook targets whichever sparse-MLA backend the platform actually selects
+(TRITON_MLA_SPARSE on sm_80/86; FLASHMLA_SPARSE on Hopper; FLASHINFER on SM120)
+and fails loudly if none is importable.
+
+STATUS (2026-07-11 review, finding M8): this script has never been run to
+completion. Until it has, `verify/contract.py::check_indices_contract` SKIPS —
+the padding semantics our kernel assumes are still inferred from upstream's
+converter source, not from a live trace.
 """
 
 import argparse
@@ -28,19 +34,43 @@ import torch
 CAPTURED = {}
 
 
+# Every sparse-MLA backend, in the order a CUDA platform may select one. On
+# sm_80/sm_86 the selected backend is TRITON_MLA_SPARSE — hooking only
+# flashmla_sparse (as an earlier version of this file did) meant the hook never
+# fired on the project's own hardware.
+_SPARSE_MLA_MODULES = (
+    "vllm.v1.attention.backends.mla.triton_mla_sparse",
+    "vllm.v1.attention.backends.mla.flashmla_sparse",
+    "vllm.v1.attention.backends.mla.flashinfer_mla_sparse",
+    "vllm.v1.attention.backends.mla.xpu_mla_sparse",
+)
+
+
 def _install_hook(out_path: str):
-    """Wrap the sparse-MLA decode call and record its inputs (first call only)."""
-    import vllm.v1.attention.backends.mla.flashmla_sparse as fms
+    """Wrap EVERY importable sparse-MLA decode entry; whichever runs, we capture."""
+    import importlib
 
-    target_cls = None
-    for name in dir(fms):
-        obj = getattr(fms, name)
-        if isinstance(obj, type) and name.endswith("Impl"):
-            target_cls = obj
-            break
-    if target_cls is None:
-        raise RuntimeError("could not locate the sparse-MLA Impl class to hook")
+    targets = []
+    for mod_name in _SPARSE_MLA_MODULES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        for name in dir(mod):
+            obj = getattr(mod, name)
+            if isinstance(obj, type) and name.endswith("Impl") and "forward" in vars(obj):
+                targets.append(obj)
+    if not targets:
+        raise RuntimeError(
+            "no sparse-MLA Impl class found in any of: " + ", ".join(_SPARSE_MLA_MODULES)
+        )
 
+    for target_cls in targets:
+        _wrap(target_cls, out_path)
+    print(f"[capture] hooked: {', '.join(c.__name__ for c in targets)}")
+
+
+def _wrap(target_cls, out_path: str):
     orig = target_cls.forward
 
     def traced(self, *args, **kwargs):
@@ -75,7 +105,6 @@ def _install_hook(out_path: str):
         return orig(self, *args, **kwargs)
 
     target_cls.forward = traced
-    print(f"[capture] hooked {target_cls.__name__}.forward")
 
 
 def main():
@@ -100,7 +129,15 @@ def main():
         trust_remote_code=True,
     )
     llm.generate(["The quick brown fox"], SamplingParams(max_tokens=4, temperature=0.0))
-    print("[capture] done" if os.path.exists(a.out) else "[capture] NOTHING CAPTURED — hook missed")
+    if os.path.exists(a.out):
+        print("[capture] done")
+    else:
+        raise SystemExit(
+            "[capture] NOTHING CAPTURED — the selected backend's Impl.forward was "
+            "never called. Check which backend the platform picked "
+            "(VLLM_ATTENTION_BACKEND / the boot log) and add its module to "
+            "_SPARSE_MLA_MODULES."
+        )
 
 
 if __name__ == "__main__":

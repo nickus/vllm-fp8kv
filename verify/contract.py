@@ -57,19 +57,13 @@ def check_layout_contract(rep: Report):
     rep.check("contract/layout-row-bytes", row == K.ROW_BYTES,
               f"vLLM row={row} B, kernel expects {K.ROW_BYTES} B")
 
-    # Scales/rope offsets: re-derive from vLLM's own golden parser, which reads
-    # scales as fp32 at element kv_lora_rank//4 and rope as bf16 at
-    # kv_lora_rank//2 + 8  (test_sparse_mla_backends.py:_dequantize_fp8_ds_mla_entry)
-    scale_byte = (512 // 4) * 4
-    rope_byte = (512 // 2 + 8) * 2
-    rep.check("contract/scale-offset", scale_byte == K.SCALE_OFF,
-              f"vLLM parser scales at byte {scale_byte}, kernel uses {K.SCALE_OFF}")
-    rep.check("contract/rope-offset", rope_byte == K.ROPE_OFF,
-              f"vLLM parser rope at byte {rope_byte}, kernel uses {K.ROPE_OFF}")
-
-    # The quantization divisor lives in C++; if it ever changes, our reference
-    # packer (used only for synthetic data) is wrong, not the kernel — but the
-    # writer-roundtrip below is what actually pins it.
+    # NOTE (2026-07-11 review, finding M7): the scale/rope byte offsets are NOT
+    # derivable from any public vLLM symbol — they exist only inside the C++
+    # writer and inside a test-local parser. Restating them here as arithmetic
+    # on the constant 512 would be checking our constants against themselves.
+    # So the offsets are pinned WHERE THEY ARE OBSERVABLE: in
+    # `check_writer_roundtrip` below, which locates them in the bytes vLLM's own
+    # writer actually emits. Only the row size is authoritative here.
 
 
 def check_writer_roundtrip(rep: Report, device="cuda"):
@@ -105,7 +99,34 @@ def check_writer_roundtrip(rep: Report, device="cuda"):
                   f"vLLM writer raised on sm_86: {type(e).__name__}: {str(e)[:120]}")
         return
 
-    got = R.ref_dequant_fp8_ds_mla_row(cache.reshape(-1, K.ROW_BYTES)[:n])
+    rows = cache.reshape(-1, K.ROW_BYTES)[:n]
+
+    # --- offsets located IN THE WRITER'S OWN OUTPUT (review finding M7) -------
+    # Scales: the writer stores 4 fp32 per-128-tile scales = amax/448. Compute
+    # what they must be from the INPUT, then find where in the row they land.
+    want_scales = (kv_c.float().reshape(n, 4, 128).abs().amax(-1) / 448.0)
+    found_scale_off = -1
+    for off in range(0, K.ROW_BYTES - 16 + 1, 4):
+        cand = rows[:, off:off + 16].contiguous().view(torch.float32)
+        if torch.allclose(cand, want_scales, rtol=1e-5, atol=1e-8):
+            found_scale_off = off
+            break
+    rep.check("contract/scale-offset-observed", found_scale_off == K.SCALE_OFF,
+              f"writer emits the 4 fp32 tile scales at byte {found_scale_off}; "
+              f"kernel reads them at {K.SCALE_OFF}")
+
+    # RoPE: stored raw bf16, so it is bit-identical to the input — search for it.
+    want_rope = k_pe.view(torch.uint8).reshape(n, 128)
+    found_rope_off = -1
+    for off in range(0, K.ROW_BYTES - 128 + 1, 2):
+        if torch.equal(rows[:, off:off + 128], want_rope):
+            found_rope_off = off
+            break
+    rep.check("contract/rope-offset-observed", found_rope_off == K.ROPE_OFF,
+              f"writer emits raw bf16 rope at byte {found_rope_off}; "
+              f"kernel reads it at {K.ROPE_OFF}")
+
+    got = R.ref_dequant_fp8_ds_mla_row(rows)
     src = torch.cat([kv_c.float(), k_pe.float()], dim=-1)
 
     # rope: raw bf16 passthrough -> must be EXACT

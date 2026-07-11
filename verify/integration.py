@@ -1,12 +1,20 @@
 # Copyright 2026 Nick / vllm-fp8kv contributors
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
-"""Integration check: our fp8 path inside vLLM's real TRITON_MLA_SPARSE backend.
+"""Component check: our fp8 kernel against vLLM's real cache writer + converter.
 
-Exercises the ACTUAL upstream call chain — their metadata, their
-`triton_convert_req_index_to_global_index`, their C++ cache writer — with our
-kernel spliced in at `forward_mqa`. Compares fp8-KV output against the SAME
-backend running bf16-KV on identical data (that is the AC1 parity gate: fp8 vs
-their own bf16 path, not vs our reference).
+Exercises three upstream components in sequence — their C++ `ds_mla` cache
+writer, their `triton_convert_req_index_to_global_index`, and the dtype/forward
+declarations `backend_patch` installs — feeding the result into our standalone
+fp8 kernel, and compares against our own fp32 reference.
+
+WHAT THIS IS NOT (corrected 2026-07-11; the previous docstring overclaimed):
+
+  * it does NOT call `forward_mqa` / `_forward_fp8_kv` — no attention metadata
+    is constructed, so the backend's forward path is not executed here;
+  * it does NOT compare fp8 against the backend's own bf16 output — the
+    baseline is our fp32 reference;
+  * it is therefore NOT an AC1 parity gate. Engine-level parity (boot vLLM with
+    `--kv-cache-dtype fp8_e4m3`, compare logits vs a bf16 run) remains open.
 
 Requires: vLLM with PR #47629 (triton_mla_sparse.py) importable.
 Run:  python verify/integration.py
@@ -95,6 +103,35 @@ def main():
     c, m = cosine(out.float(), ref), max_abs(out.float(), ref)
     rep.check("integration/full-chain-decode", c > 0.999 and out.isfinite().all(),
               f"cosine={c:.6f} max_abs={m:.2e} (their writer + their converter + our kernel)")
+
+    # --- the PATCHED UPSTREAM kernel, on the same fp8 cache and indices.
+    #     Without this, nothing in the shipped harness ever checks the artifact
+    #     we actually propose upstream (review finding M2).
+    try:
+        from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
+            triton_mla_sparse_attention,
+        )
+    except ImportError as e:
+        rep.check("integration/patched-upstream-kernel", False,
+                  f"cannot import upstream sparse kernel: {e}")
+    else:
+        import inspect
+        src = inspect.getsource(triton_mla_sparse_attention)
+        if "is_fp8" not in src:
+            rep.check("integration/patched-upstream-kernel", False,
+                      "runtime kernel is UNPATCHED (no is_fp8 dispatch) — apply "
+                      "patches/triton_mla_sparse_fp8.patch to site-packages, not "
+                      "just to the git clone")
+        else:
+            up = triton_mla_sparse_attention(
+                q, cache.reshape(-1, 1, 656), glob.view(n_tokens, 1, -1), sm,
+            )
+            up = up[0] if isinstance(up, tuple) else up
+            cu, mu = cosine(up.float(), ref), max_abs(up.float(), ref)
+            rep.check("integration/patched-upstream-kernel",
+                      cu > 0.999 and up.isfinite().all(),
+                      f"cosine={cu:.6f} max_abs={mu:.2e} (upstream's split-KV + "
+                      f"merge, fp8 branch)")
 
     print(f"== done: {rep.failed} failure(s) ==")
     sys.exit(min(rep.failed, 125))

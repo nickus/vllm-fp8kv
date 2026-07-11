@@ -199,6 +199,9 @@ def _thread_is_fp8(s: str) -> str:
         1,
     )
     # 2) both `_sparse_mla_compute_tile(...)` calls end with `        BLOCK_DPE,`
+    n_call = s.count("        BLOCK_DPE,\n    )")
+    if n_call != 2:
+        sys.exit(f"expected exactly 2 compute_tile call sites, found {n_call}")
     s = s.replace(
         "        BLOCK_DPE,\n    )",
         "        BLOCK_DPE,\n        IS_FP8,\n    )",
@@ -206,24 +209,20 @@ def _thread_is_fp8(s: str) -> str:
     return s
 
 
-# --- 5. THE PERF FIX: fp8 must get its OWN autotuned config -------------------
-# Upstream's autotune key is (index_topk, kv_group_num) — it does NOT include
-# the dtype, so the fp8 path silently REUSES the config Triton cached for bf16.
-# That config is tuned for bf16's access pattern (1152 B rows, 2 loads); fp8
-# reads 656 B rows + a scale load and wants a much larger BLOCK_N and more
-# warps. Measured on RTX 3090, topk=2048: with bf16's config fp8 ran 608 us at
-# bs=32; correctly autotuned (BLOCK_N=64, 8 warps, split-KV) it runs 201 us —
-# i.e. 1.36x FASTER than bf16, instead of 2.2x slower. Adding IS_FP8 to the key
-# is the entire fix.
-AUTOTUNE_ANCHOR_1 = (
-    '@triton.autotune(configs=_FINAL_AUTOTUNE_CONFIGS, key=["index_topk", "kv_group_num"])'
-)
-AUTOTUNE_NEW_1 = (
-    '@triton.autotune(\n'
-    '    configs=_FINAL_AUTOTUNE_CONFIGS,\n'
-    '    key=["index_topk", "kv_group_num", "IS_FP8"],\n'
-    ')'
-)
+# --- 5. autotuning: NO key change is needed (2026-07-11 review) ---------------
+# An earlier revision added IS_FP8 to the @triton.autotune keys, believing the
+# fp8 path would otherwise inherit bf16's cached config. That was wrong twice
+# over: (a) IS_FP8 is a tl.constexpr, so each value compiles a SEPARATE kernel
+# specialization with its own autotune cache; (b) Triton >= 3.x appends every
+# tensor argument's dtype to the autotune cache key anyway
+# (triton/runtime/autotuner.py, `key.append(str(arg.dtype))`), and the fp8
+# cache arrives as uint8 vs bf16.
+#
+# The REAL open item is the config LISTS: upstream's _FINAL_AUTOTUNE_CONFIGS
+# (BLOCK_N=16 only) and _SPLIT_AUTOTUNE_CONFIGS (BLOCK_N=32 only) were chosen
+# for bf16's 1152 B rows; whether fp8's 656 B rows + scale load want larger
+# blocks/more warps is unmeasured on the real kernel — extending those lists
+# is deferred until measured on hardware (see RESULTS.md).
 
 DISPATCH_ANCHOR = """    assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK"""
 DISPATCH_NEW = """    # fp8_ds_mla: the cache arrives as raw uint8 pages (656 B/token) instead of
@@ -249,17 +248,15 @@ def main():
         (LOADS_ANCHOR, LOADS_NEW, "K/RoPE loads"),
         (V_ANCHOR, V_NEW, "V reuse"),
         (DISPATCH_ANCHOR, DISPATCH_NEW, "dispatcher fp8 detect"),
-        (AUTOTUNE_ANCHOR_1, AUTOTUNE_NEW_1, "fp8 autotune key (the perf fix)"),
     ]:
         if anchor not in s:
             sys.exit(f"ANCHOR NOT FOUND ({name}) — upstream drifted; re-derive")
         s = s.replace(anchor, new, 1)
     s = _thread_is_fp8(s)
-    # the split kernel's @triton.autotune(...) uses a multi-line key list; add
-    # IS_FP8 there too so BOTH autotuned entry points key on the dtype.
-    s = s.replace('    key=["index_topk", "kv_group_num"],',
-                  '    key=["index_topk", "kv_group_num", "IS_FP8"],')
     # the two kernel launches must pass IS_FP8=is_fp8
+    n_launch = s.count("        BLOCK_DPE=_BLOCK_DPE,")
+    if n_launch != 2:
+        sys.exit(f"expected exactly 2 kernel launches, found {n_launch}")
     s = s.replace("        BLOCK_DPE=_BLOCK_DPE,", "        BLOCK_DPE=_BLOCK_DPE,\n        IS_FP8=is_fp8,")
 
     open(path, "w").write(s)
@@ -267,6 +264,13 @@ def main():
                           capture_output=True, text=True).stdout
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "triton_mla_sparse_fp8.patch")
+    if not diff.strip():
+        # `src` is not a git worktree (e.g. site-packages), so git produced
+        # nothing. The file above IS patched, but overwriting the shipped diff
+        # with an empty one would silently destroy the artifact.
+        sys.exit(f"patched {path}, but `git diff` in {src} is empty — not a git "
+                 f"checkout? REFUSING to overwrite {out}. To apply the shipped "
+                 f"patch to a non-git tree use: patch -p1 -d {src} < {out}")
     open(out, "w").write(diff)
     print(f"patched {path}\nwrote {out} ({len(diff.splitlines())} diff lines)")
 
