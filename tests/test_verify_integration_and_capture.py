@@ -77,7 +77,7 @@ def test_hook_targets_the_backend_ampere_actually_selects(monkeypatch, tmp_path)
     capture_indices._install_hook(str(out))
 
     tms = sys.modules["vllm.v1.attention.backends.mla.triton_mla_sparse"]
-    assert tms.TritonMLASparseImpl.forward.__name__ == "traced", (
+    assert tms.TritonMLASparseImpl.forward_mqa.__name__ == "traced", (
         "the backend selected on Ampere was not hooked"
     )
 
@@ -89,7 +89,7 @@ def test_hook_records_the_index_tensor_and_pool_size(monkeypatch, tmp_path):
 
     tms = sys.modules["vllm.v1.attention.backends.mla.triton_mla_sparse"]
     calls = []
-    tms.TritonMLASparseImpl.forward = lambda self, *a, **k: calls.append(1)
+    tms.TritonMLASparseImpl.forward_mqa = lambda self, *a, **k: calls.append(1)
 
     capture_indices._install_hook(str(out))
 
@@ -97,7 +97,7 @@ def test_hook_records_the_index_tensor_and_pool_size(monkeypatch, tmp_path):
     idx[0, 0, ::5] = -1
     cache = torch.zeros(8, 64, 656, dtype=torch.uint8)
     impl = tms.TritonMLASparseImpl()
-    impl.forward(torch.randn(2, 16, 576), cache, indices=idx)
+    impl.forward_mqa(torch.randn(2, 16, 576), cache, indices=idx)
 
     assert calls == [1], "the original forward must still run"
     assert out.exists()
@@ -128,10 +128,32 @@ def test_captured_trace_replays_through_the_contract_check(monkeypatch, tmp_path
 
     tms = sys.modules["vllm.v1.attention.backends.mla.triton_mla_sparse"]
     idx = torch.randint(0, 512, (2, 1, 128), dtype=torch.int32)
-    tms.TritonMLASparseImpl().forward(torch.randn(2, 16, 576, device=DEVICE),
-                                      torch.zeros(8, 64, 656, dtype=torch.uint8),
-                                      indices=idx)
+    tms.TritonMLASparseImpl().forward_mqa(torch.randn(2, 16, 576, device=DEVICE),
+                                          torch.zeros(8, 64, 656, dtype=torch.uint8),
+                                          indices=idx)
 
     rep = Report()
     contract.check_indices_contract(rep, trace_path=str(out))
     assert rep.failed == 0, rep.lines
+
+
+def test_hook_captures_indices_from_the_impl_instance(monkeypatch, tmp_path):
+    """forward_mqa does NOT receive the topk indices as an argument — the impl
+    reads them off `self.topk_indices_buffer`. A hook that only records call
+    arguments captures nothing useful, which is why the first live run came back
+    empty."""
+    fakes.install(monkeypatch)
+    capture_indices.CAPTURED.clear()
+    out = tmp_path / "trace.pt"
+    capture_indices._install_hook(str(out))
+
+    tms = sys.modules["vllm.v1.attention.backends.mla.triton_mla_sparse"]
+    impl = tms.TritonMLASparseImpl()
+    impl.topk_indices_buffer = torch.randint(0, 512, (2, 128), dtype=torch.int32)
+    impl.forward_mqa(torch.randn(2, 16, 576),
+                     torch.zeros(8, 64, 656, dtype=torch.uint8), None, None)
+
+    rec = torch.load(out)
+    assert "topk_indices_buffer" in rec
+    assert rec["indices_from"] == "topk_indices_buffer"
+    assert rec["num_slots"] == 8 * 64

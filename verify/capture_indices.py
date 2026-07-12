@@ -58,20 +58,27 @@ def _install_hook(out_path: str):
             continue
         for name in dir(mod):
             obj = getattr(mod, name)
-            if isinstance(obj, type) and name.endswith("Impl") and "forward" in vars(obj):
-                targets.append(obj)
+            if not (isinstance(obj, type) and name.endswith("Impl")):
+                continue
+            # the sparse-MLA decode entry point is `forward_mqa`; `forward` may
+            # only exist on the base class (hooking it would miss the decode).
+            for entry in ("forward_mqa", "forward"):
+                if entry in vars(obj):
+                    targets.append((obj, entry))
+                    break
     if not targets:
         raise RuntimeError(
             "no sparse-MLA Impl class found in any of: " + ", ".join(_SPARSE_MLA_MODULES)
         )
 
-    for target_cls in targets:
-        _wrap(target_cls, out_path)
-    print(f"[capture] hooked: {', '.join(c.__name__ for c in targets)}")
+    for target_cls, entry in targets:
+        _wrap(target_cls, entry, out_path)
+    print(f"[capture] hooked: "
+          + ", ".join(f"{c.__name__}.{e}" for c, e in targets))
 
 
-def _wrap(target_cls, out_path: str):
-    orig = target_cls.forward
+def _wrap(target_cls, entry: str, out_path: str):
+    orig = getattr(target_cls, entry)
 
     def traced(self, *args, **kwargs):
         if not CAPTURED:
@@ -82,6 +89,11 @@ def _wrap(target_cls, out_path: str):
             for k, v in kwargs.items():
                 if torch.is_tensor(v):
                     rec[k] = v.detach().cpu()
+            # the topk indices do not travel as an argument of forward_mqa —
+            # the impl reads them off itself. Capture them from the instance.
+            buf = getattr(self, "topk_indices_buffer", None)
+            if torch.is_tensor(buf):
+                rec["topk_indices_buffer"] = buf.detach().cpu()
             # the topk indices are the int tensor with a topk-sized last dim.
             # NB: iterate over a SNAPSHOT of the tensors — the loops below add
             # non-tensor keys ("indices_from") to rec, and a later `v.dtype`
@@ -108,7 +120,7 @@ def _wrap(target_cls, out_path: str):
                       f"unique_negatives={sorted(set(idx[idx < 0].tolist()))[:5]}")
         return orig(self, *args, **kwargs)
 
-    target_cls.forward = traced
+    setattr(target_cls, entry, traced)
 
 
 def main():

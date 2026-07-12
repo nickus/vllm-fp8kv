@@ -1,0 +1,9 @@
+# verify/engine_boot.py and verify/rebench.py are THEMSELVES tests — they boot a
+# real vLLM engine and time the patched kernel on a GPU. They are executable
+# acceptance criteria (AC1 / AC3), run on hardware, and their results are
+# recorded in RESULTS.md. Unit-testing them against fakes would test the fakes.
+# Everything they depend on (backend_patch, the kernel, the reference) IS covered.
+[run]
+omit =
+    verify/engine_boot.py
+    verify/rebench.py

@@ -109,8 +109,8 @@ class FakeTritonMLASparseImpl:
         self.bf16_calls += 1
         return torch.zeros(q.shape[0], self.num_heads, NOPE, dtype=q.dtype, device=q.device)
 
-    def forward(self, *args, **kwargs):
-        """The entry point `capture_indices` hooks."""
+    def forward_mqa(self, *args, **kwargs):
+        """The sparse-MLA decode entry point — what capture_indices hooks."""
         return None
 
 
