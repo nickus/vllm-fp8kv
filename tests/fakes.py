@@ -12,6 +12,7 @@ testable at all; before this they were never executed by any test.
 `install(monkeypatch, ...)` inserts the fakes into `sys.modules` for one test.
 """
 
+import dataclasses
 import sys
 import types
 
@@ -123,6 +124,32 @@ class FakeFlashMLASparseBackend:
         return (num_blocks, block_size, head_size)
 
 
+@dataclasses.dataclass(frozen=True)
+class FakeMLAAttentionSpec:
+    """Mirrors vLLM's MLAAttentionSpec: FROZEN, and kv_quant_mode defaults to
+    NONE even for an fp8_ds_mla pool — which is the bug backend_patch fixes."""
+
+    block_size: int = 64
+    num_kv_heads: int = 1
+    head_size: int = 576
+    cache_dtype_str: str | None = None
+    kv_quant_mode: str = "NONE"
+
+
+class FakeMLAAttention:
+    """Only get_kv_cache_spec, which is what backend_patch wraps."""
+
+    def __init__(self, kv_cache_dtype="auto"):
+        self.kv_cache_dtype = kv_cache_dtype
+
+    def get_kv_cache_spec(self, vllm_config):
+        return FakeMLAAttentionSpec(cache_dtype_str=vllm_config)
+
+
+def get_kv_quant_mode(kv_cache_dtype: str) -> str:
+    return "FP8_PER_TENSOR" if str(kv_cache_dtype).startswith("fp8") else "NONE"
+
+
 def canonicalize_sparse_mla_kv_cache_dtype(attn_backend, kv_cache_dtype):
     """Upstream's version: maps fp8 -> fp8_ds_mla for FLASHMLA_SPARSE / SM120 only."""
     name = attn_backend.get_name()
@@ -159,6 +186,10 @@ def install(monkeypatch, *, writer=None, sparse_kernel=None, row_bytes=ROW_BYTES
     mla_attention = _make_module(
         "vllm.model_executor.layers.attention.mla_attention",
         _canonicalize_sparse_mla_kv_cache_dtype=canonicalize_sparse_mla_kv_cache_dtype,
+        MLAAttention=FakeMLAAttention,
+    )
+    kv_cache_iface = _make_module(
+        "vllm.v1.kv_cache_interface", get_kv_quant_mode=get_kv_quant_mode
     )
     kernel_mod = _make_module(
         "vllm.v1.attention.ops.triton_mla_sparse_kernel",
@@ -185,6 +216,7 @@ def install(monkeypatch, *, writer=None, sparse_kernel=None, row_bytes=ROW_BYTES
         "vllm.v1.attention.backends.mla.triton_mla_sparse": triton_sparse,
         "vllm.v1.attention.backends.mla.flashmla_sparse": flashmla,
         "vllm.v1.attention.backends.mla.xpu_mla_sparse": xpu_sparse,
+        "vllm.v1.kv_cache_interface": kv_cache_iface,
         "vllm.v1.attention.ops": _make_module("vllm.v1.attention.ops"),
         "vllm.v1.attention.ops.triton_mla_sparse_kernel": kernel_mod,
     }
@@ -200,11 +232,15 @@ def install(monkeypatch, *, writer=None, sparse_kernel=None, row_bytes=ROW_BYTES
         FakeTritonMLASparseBackend, "get_kv_cache_shape",
         FakeTritonMLASparseBackend.__dict__["get_kv_cache_shape"], raising=False,
     )
+    # apply() rebinds this classmethod; restore it between tests
+    monkeypatch.setattr(FakeMLAAttention, "get_kv_cache_spec",
+                        FakeMLAAttention.__dict__["get_kv_cache_spec"], raising=False)
     return types.SimpleNamespace(
         backend=FakeTritonMLASparseBackend,
         impl=FakeTritonMLASparseImpl,
         mla_attention=mla_attention,
         kernel_mod=kernel_mod,
+        MLAAttention=FakeMLAAttention,
     )
 
 

@@ -32,6 +32,22 @@ def test_apply_declares_the_fp8_dtype(vllm):
     assert {"auto", "bfloat16"} <= set(vllm.backend.supported_kv_cache_dtypes)
 
 
+def test_apply_declares_the_cli_fp8_aliases(vllm):
+    """Load-bearing, and found only by booting a real engine: vLLM SELECTS the
+    backend with the RAW `--kv-cache-dtype` value and canonicalizes only
+    afterwards (mla_attention.py: get_attn_backend(...) then
+    _canonicalize_sparse_mla_kv_cache_dtype(...)). So declaring `fp8_ds_mla`
+    alone is not enough — the selector never sees that name, and the engine dies
+    with "No valid attention backend found ... TRITON_MLA_SPARSE:
+    [kv_cache_dtype not supported]". FLASHMLA_SPARSE declares "fp8" as an alias
+    for exactly this reason."""
+    backend_patch.apply()
+    declared = set(vllm.backend.supported_kv_cache_dtypes)
+    assert {"fp8", "fp8_e4m3"} <= declared, (
+        "the CLI-visible fp8 names must be declared or the backend is never selected"
+    )
+
+
 def test_apply_fixes_the_cache_shape(vllm):
     """Without this the engine allocates 576-wide bf16 rows and the C++ writer
     scribbles past the end of every fp8 page."""
@@ -196,3 +212,37 @@ def test_forward_mqa_uses_upstreams_index_converter(vllm):
     assert int(idx[1]) == 3 * 64 + 1
     assert int(idx[2]) == 1 * 64 + 0, "second block not remapped"
     assert int(idx[3]) == -1, "the -1 sentinel must survive the conversion"
+
+
+def test_apply_marks_the_fp8_spec_as_quantized(vllm):
+    """Found only by booting a real engine (2026-07-12).
+
+    `MLAAttention.get_kv_cache_spec` builds MLAAttentionSpec WITHOUT
+    kv_quant_mode, so it defaults to NONE. The worker's reshape path then asks
+    the backend for the *unquantized* cache shape:
+
+        layer_cache_dtype = "auto" if spec.kv_quant_mode == NONE else cache_dtype
+
+    ...while the pool itself was allocated from spec.page_size_bytes, which DOES
+    special-case fp8_ds_mla at 656 B/token. The engine dies reshaping a 656-byte
+    pool into 576-byte rows:
+
+        RuntimeError: shape '[128811, 64, 576]' is invalid for input of size 5408001024
+
+    Declaring the quant mode makes allocation and reshape agree.
+    """
+    backend_patch.apply()
+    layer = vllm.MLAAttention(kv_cache_dtype="fp8_ds_mla")
+
+    spec = layer.get_kv_cache_spec("fp8_ds_mla")
+    assert spec.kv_quant_mode != "NONE", "fp8 pool still declared unquantized"
+
+    bf16_spec = layer.get_kv_cache_spec("auto")
+    assert bf16_spec.kv_quant_mode == "NONE", "bf16 path must be untouched"
+
+
+def test_spec_patch_is_idempotent(vllm):
+    backend_patch.apply()
+    first = vllm.MLAAttention.get_kv_cache_spec
+    backend_patch.apply()
+    assert vllm.MLAAttention.get_kv_cache_spec is first

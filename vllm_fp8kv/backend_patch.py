@@ -117,6 +117,45 @@ def _get_kv_cache_shape_fp8_aware(
     return (num_blocks, block_size, head_size)
 
 
+def _patch_mla_spec_quant_mode(mla_mod) -> None:
+    """Make the MLA KV-cache spec declare that an fp8_ds_mla pool IS quantized.
+
+    `MLAAttention.get_kv_cache_spec` builds `MLAAttentionSpec(...)` without
+    `kv_quant_mode`, so it defaults to `KVQuantMode.NONE`. The worker's reshape
+    path then does:
+
+        layer_cache_dtype = "auto" if spec.kv_quant_mode == NONE else cache_dtype
+        shape = backend.get_kv_cache_shape(..., cache_dtype_str=layer_cache_dtype)
+
+    (vllm/v1/worker/gpu/attn_utils.py). With NONE it asks for the *unquantized*
+    shape — 576-wide — while the pool was allocated from
+    `MLAAttentionSpec.page_size_bytes`, which DOES special-case fp8_ds_mla at
+    656 B/token. The engine then dies reshaping a 656-byte pool into 576-byte
+    rows. Declaring the quant mode makes both halves agree.
+    """
+    import dataclasses
+
+    from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+    cls = mla_mod.MLAAttention
+    if getattr(cls.get_kv_cache_spec, "_vllm_fp8kv", False):
+        return
+    orig = cls.get_kv_cache_spec
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = orig(self, vllm_config)
+        cache_dtype_str = getattr(spec, "cache_dtype_str", None)
+        if cache_dtype_str == FP8_DS_MLA:
+            # the spec is a frozen dataclass — rebuild it, don't mutate it
+            spec = dataclasses.replace(
+                spec, kv_quant_mode=get_kv_quant_mode(cache_dtype_str)
+            )
+        return spec
+
+    get_kv_cache_spec._vllm_fp8kv = True
+    cls.get_kv_cache_spec = get_kv_cache_spec
+
+
 def apply() -> None:
     """Monkeypatch a live vLLM (test/bench use; the .patch file is for upstream)."""
     from vllm.model_executor.layers.attention import mla_attention as mla_mod
@@ -127,12 +166,21 @@ def apply() -> None:
     impl._forward_fp8_kv = _forward_fp8_kv
     impl.forward_mqa = _forward_mqa_fp8_aware
     backend.get_kv_cache_shape = staticmethod(_get_kv_cache_shape_fp8_aware)
+    _patch_mla_spec_quant_mode(mla_mod)
 
-    if FP8_DS_MLA not in backend.supported_kv_cache_dtypes:
-        backend.supported_kv_cache_dtypes = [
-            *backend.supported_kv_cache_dtypes,
-            FP8_DS_MLA,
-        ]
+    # Declare BOTH the storage format and the CLI-visible aliases. vLLM selects
+    # the backend with the RAW `--kv-cache-dtype` value and canonicalizes only
+    # afterwards (mla_attention.py: get_attn_backend() precedes
+    # _canonicalize_sparse_mla_kv_cache_dtype()), so a backend that declares
+    # only `fp8_ds_mla` is never selected for `--kv-cache-dtype fp8_e4m3` — the
+    # engine dies with "No valid attention backend found". FLASHMLA_SPARSE
+    # declares "fp8" as an alias for exactly this reason.
+    for dtype in (FP8_DS_MLA, "fp8", "fp8_e4m3"):
+        if dtype not in backend.supported_kv_cache_dtypes:
+            backend.supported_kv_cache_dtypes = [
+                *backend.supported_kv_cache_dtypes,
+                dtype,
+            ]
 
     # `--kv-cache-dtype fp8 / fp8_e4m3` must canonicalize to fp8_ds_mla for
     # this backend, as upstream already does for FLASHMLA_SPARSE and SM120.

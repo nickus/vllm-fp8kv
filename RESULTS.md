@@ -1,120 +1,126 @@
 # Results — fp8-KV for vLLM's Ampere DSA path
 
-Measured on **RTX 3090 (sm_86)**, driver 580.159, CUDA 12.8, torch 2.13,
-Triton 3.7, vLLM nightly + PR #47629 (Python-only overlay, head `bbe2ab4d6`).
+Measured on **RTX 3090 (sm_86)**, driver 595, CUDA 12.8, torch 2.11, Triton 3.6,
+vLLM 0.25.0 nightly + PR #47629 (head `bbe2ab4d6`, Python-only overlay).
 
-> **CORRECTED 2026-07-11** after an independent adversarial audit
-> ([REVIEW-2026-07-11.md](REVIEW-2026-07-11.md)), whose four core findings were
-> re-verified against primary sources before this rewrite. What changed:
->
-> 1. The **decode-parity table (0.85–1.02×) and the 0.999873 figure are
->    retracted.** They were measured on a scratch split-KV kernel whose merge
->    step (`tl.atomic_add` of locally-normalized per-split outputs, no LSE
->    weighting) does not compute a global softmax. Cosine similarity is
->    scale-invariant and the i.i.d. Gaussian test data made per-split means
->    nearly parallel, so the error surfaced only as the drop from 0.999996 to
->    0.999873 — misread at the time as quantization noise.
-> 2. The **"upstream autotune key is dtype-blind" bug report is withdrawn.**
->    Triton ≥ 3.x appends every tensor argument's dtype to the autotune cache
->    key (`triton/runtime/autotuner.py`), and `IS_FP8` is a `tl.constexpr`,
->    which specializes the kernel anyway. The 608 → 201 µs table compared two
->    different kernels — one of them the invalid one above — at a config that
->    is not in upstream's config space.
-> 3. **AC1 was never verified at engine level.** No vLLM engine has booted
->    with fp8 KV through this patch; all correctness numbers are kernel-level
->    on synthetic data. (The monkeypatch now also covers `get_kv_cache_shape`
->    and dtype canonicalization, which a real boot needs — previously missing.)
-> 4. The shipped `.patch` had drifted from its generator (the generator had
->    grown the misguided autotune hunks without regeneration; one of them
->    silently no-opped). The generator has been reverted to match the shipped
->    224-line patch, which regenerates byte-identically and is the correct
->    artifact.
+> **2026-07-12 — everything below was re-measured on hardware.** The numbers in
+> the version of this file dated 2026-07-11 came partly from a scratch kernel
+> whose split-KV merge was invalid (see [REVIEW-2026-07-11.md](REVIEW-2026-07-11.md));
+> they are gone. Every timing here comes from **upstream's own patched kernel**
+> (its split-KV, its LSE merge, its autotune), and **every timed configuration is
+> correctness-gated on cosine AND max_abs** — the missing max_abs gate is exactly
+> how an 8×-wrong kernel passed last time.
 
-## What is verified (kernel level, on hardware)
+## AC1 — engine boot + logits parity: **PASS**
 
-**fp8-KV sparse-MLA decode runs on Ampere.** vLLM's `TRITON_MLA_SPARSE` backend
-is bf16-KV-only because *"Triton fp8e4nv store … does not compile on SM80"*
-(#47629). We removed that constraint by never asking Triton for fp8: the
-standard `fp8_ds_mla` pages are loaded as raw `uint8` and decoded in-register
-with bit-math that is bit-exact vs `torch.float8_e4m3fn`.
+The acceptance criterion this project had never actually run. `verify/engine_boot.py`
+boots two real vLLM engines on a GlmMoeDsa model and compares them:
 
 | Check | Result |
 |---|---|
-| fp8 dequant, all 256 byte values, on device | **bit-exact** |
-| Standalone kernel vs fp32 golden ref (topk 2048, 64K-slot pool, 128 heads) | **cosine 0.999996** |
-| Decode over pages written by **vLLM's own C++ `ds_mla` writer** | **cosine 0.999996** |
-| `k_scale=2.0` passed to their writer (tripwire) | correctly **ignored** → our no-double-scale decision is right |
-| Leading-masked chunks (NaN-poisoning case) | finite, 0.999996 |
-| 3.5M-slot pool (int32 offset overflow boundary) | **cosine 0.999997** |
-| Upstream's patched split-KV kernel + their index converter | cosine 0.999996 — measured by a scratch script on the (destroyed) bench box; **not reproducible from the shipped harness**, re-verification queued |
+| Engine boots with `--kv-cache-dtype fp8_e4m3` | **yes**, backend = `TRITON_MLA_SPARSE` |
+| KV pages are really fp8 | **656 B/token** (bf16 run: 576 B) |
+| Our fp8 decode actually executed | **16 calls**, bf16 decode 0 |
+| Baseline really used upstream's bf16 path | 16 calls, fp8 0 |
+| Logits parity vs bf16 (teacher-forced) | **cosine 0.999999 / 0.999997** |
+| Top-1 agreement (teacher-forced) | **0.80 / 1.00** |
 
-**vLLM's C++ fp8 cache writer runs on sm_86 unmodified** — verified by
-execution (`ENABLE_FP8` is gated on CUDA version, not architecture).
+Parity is measured **teacher-forced** — the same prompt positions scored by both
+engines. Free-running greedy tokens are *not* a valid gate: on a random-weight
+toy the logits are near-flat over a 50k vocab, so a 2 % fp8 perturbation flips a
+near-tie, and after one divergence the two runs are scoring different sequences.
+(That trap is why the first version of this test "failed" for the wrong reason.)
 
-The verify harness (16 checks in the current tree) passed on-device; the raw
-logs were lost with the rented boxes, so treat "harness green" as historical
-until the queued re-run.
+**Three engine-level bugs had to be fixed to get here**, none of which any
+kernel test could have found — see `vllm_fp8kv/backend_patch.py`:
 
-## AC2 — KV pool capacity: format arithmetic, target missed as written
+1. **The CLI dtype is never seen by the selector.** vLLM picks the backend with
+   the *raw* `--kv-cache-dtype` and canonicalizes afterwards, so a backend that
+   declares only `fp8_ds_mla` is never selected: *"No valid attention backend
+   found … TRITON_MLA_SPARSE: [kv_cache_dtype not supported]"*. FLASHMLA_SPARSE
+   declares `"fp8"` as an alias for exactly this reason; we now do too.
+2. **The KV spec claims to be unquantized.** `MLAAttention.get_kv_cache_spec`
+   builds `MLAAttentionSpec` without `kv_quant_mode`, so it defaults to `NONE`.
+   The pool is then *allocated* from `page_size_bytes` (which does special-case
+   fp8_ds_mla at 656 B) but *reshaped* using the unquantized 576-wide shape:
+   `RuntimeError: shape '[128811, 64, 576]' is invalid for input of size 5408001024`.
+3. **The worker is a separate process.** vLLM V1 runs EngineCore out-of-process,
+   so an in-process monkeypatch never reaches it. A real deployment needs a
+   plugin entry point or `sitecustomize.py` (the same lesson dsa-3090 learned
+   with sglang's subprocess workers).
 
-| pool | bf16 KV | fp8 KV |
-|---|---|---|
-| 16 GiB | 14.91 M tokens | **26.19 M tokens** |
-| 20 GiB | 18.64 M tokens | **32.74 M tokens** |
+## Kernel correctness (harness, on-device)
 
-`1152 / 656 = 1.756×`. Two honesty notes the original version of this file
-did not make:
-
-* **1.756× is arithmetic, not a measurement** — no engine allocated these
-  pools. The AC target of ≥1.9× is arithmetically unreachable for
-  `fp8_ds_mla` (512 fp8 + 16 B inline scales + 128 B raw-bf16 RoPE = 656 B vs
-  1152 B bf16), so the AC as written is **missed**; 1.756× is the format's
-  ceiling.
-* At engine level the DSA **indexer K-cache** (~132 B/token, same dtype in
-  both configs) dilutes the effective pool gain to **≈1.63×**.
-
-## AC3 — decode throughput: NOT at parity; real numbers below
-
-The only decode timings ever taken on the **real patched upstream kernel**
-(scratch `test_patched.py`, commit `12a6a75`, RTX 3090, topk=2048):
-
-| bs | fp8 vs bf16 |
+| Check | Result |
 |---|---|
-| 8 | **0.92×** |
-| 32 | **0.45×** |
+| fp8 dequant, all 256 byte values | **bit-exact** vs `torch.float8_e4m3fn` |
+| Decode vs fp32 reference (up to 64K pool, topk 2048, 128 heads) | **cosine 0.999996** |
+| Over pages written by vLLM's own C++ `ds_mla` writer | **cosine 0.999996** |
+| `k_scale=2.0` tripwire | correctly **ignored** by the writer |
+| Leading fully-masked chunks (the NaN case) | finite, 0.999996 |
+| 3.5 M-slot pool (int32 offset overflow boundary) | **cosine 0.999997** |
+| Harness | **16/16, 0 failures** |
+| Test suite on GPU | **90 passed**, 91.6 % coverage |
 
-AC3 (≥95% @8K, ≥100% @64K) is therefore **not met**, and — a further audit
-point — it was never measured on its own axis: the AC specifies context-length
-gates, while all timings swept batch size at one fixed pool.
+## AC2 — KV pool capacity: 1.756× (format ceiling), ~1.63× effective
 
-The retracted parity table suggested the gap could be closed with fp8-specific
-launch configs (larger BLOCK_N, more warps). That is now an **unverified
-hypothesis**: upstream's `_FINAL_AUTOTUNE_CONFIGS`/`_SPLIT_AUTOTUNE_CONFIGS`
-lists are bf16-oriented (BLOCK_N=16/32 only), and extending them for fp8's
-656-byte rows is plausible but must be measured on the real kernel. Queued for
-the next GPU session, before any upstream RFC cites a speed number.
+`1152 / 656 = 1.756×`. Arithmetic, not a measurement — and the AC target of
+≥1.9× is **unreachable** for this format (512 fp8 + 16 B inline scales + 128 B
+raw-bf16 RoPE). At engine level the DSA indexer's own K-cache (same size in both
+configs) dilutes the gain to **≈1.63×**. Recorded as a **miss against the AC as
+written**, with the honest ceiling stated.
 
-The three ALU-reduction experiments (straight-to-bf16 decode, 256-entry LUT,
-coalesced-V) all failed to help in their day-of runs, suggesting the cost is
-load-stream- rather than ALU-bound — but the shipped `variants.py` only
-exercises two of the five variants, so this too is anecdote, not evidence.
+## AC3 — decode throughput: **0.84–0.93×** of bf16, and it is not tunable away
+
+Upstream's patched kernel, fp8 vs bf16, only the KV dtype differing:
+
+| context (pool) | bs | fp8 | bf16 | fp8/bf16 | correctness |
+|---|---|---|---|---|---|
+| 8 K | 1 | 112.8 µs | 104.6 µs | **0.93×** | 0.999996 |
+| 16 K | 1 | 123.9 µs | 106.3 µs | 0.86× | 0.999996 |
+| 64 K | 1 | 123.1 µs | 103.9 µs | 0.84× | 0.999996 |
+| 128 K | 1 | 125.0 µs | 108.1 µs | 0.87× | 0.999996 |
+| 64 K | 8 | 567.7 µs | 310.7 µs | 0.55× | 0.999996 |
+| 64 K | 32 | 1471 µs | 1293 µs | 0.88× | 0.999996 |
+| 64 K | 64 | 3017 µs | 2591 µs | 0.86× | 0.999996 |
+
+AC3 asked for ≥95 % @8K and ≥100 % @64K: **missed** (0.93× and 0.84×). fp8 costs
+roughly **10–15 % of decode speed** across context lengths, with a worse dip at
+bs=8 (0.55×) where the split-KV heuristic changes regime.
+
+### The config-list hypothesis is REFUTED
+
+RFC #48374 flagged an open question: are upstream's autotune config lists
+(`BLOCK_N=16` for the single-pass kernel, `32` for split-KV) simply bf16-shaped,
+so that fp8's 656-byte rows want bigger blocks? Measured, at bs=32:
+
+| BLOCK_N | warps | stages | fp8 | bf16 | fp8/bf16 |
+|---|---|---|---|---|---|
+| 16 | 4 | 3 | **1415 µs** | 1210 µs | 0.85× |
+| 32 | 4 | 3 | 1546 µs | **1088 µs** | 0.70× |
+| **64 / 128** | any | any | **does not compile** | — | shared-memory OOM on sm_86 |
+
+**Bigger blocks are not available on this hardware** — `BLOCK_N ≥ 64` exceeds
+sm_86's 100 KB shared-memory cap. (The retracted "BLOCK_N=64, 8 warps wins"
+config could never have run in the real kernel at all.) fp8's best config is
+essentially what upstream already ships; bf16's best is `BLOCK_N=32`. Best-vs-best
+is **0.77×**. There is no free tuning win here.
 
 ## Honest summary
 
 | AC | Status |
 |---|---|
-| AC1 fp8 boots + logits parity | ❌ **not verified at engine level** — kernel-level correctness only (0.999996 on synthetic data); no vLLM boot with fp8 KV has run |
-| AC2 pool ≥1.9× | ❌ as written (target exceeds the format ceiling). Format arithmetic: **1.756×**; effective engine-level ≈1.63× incl. indexer cache |
-| AC3 speed ≥95%/100% | ❌ **0.92× (bs=8) / 0.45× (bs=32)** on the real patched kernel; parity claim retracted; config-tuning hypothesis unmeasured |
-| AC5 no non-Ampere regression | ◻ argued statically (`IS_FP8` defaults False, bf16 branch source-identical) — **never tested on non-Ampere hardware** |
-| AC7 upstream package | ✅ 3 filed: vLLM [#48364](https://github.com/vllm-project/vllm/issues/48364) + [#48366](https://github.com/vllm-project/vllm/pull/48366) (NaN bug + fix PR), [#48374](https://github.com/vllm-project/vllm/issues/48374) (fp8-KV RFC, honest 0.92×/0.45× table). Patch (224 lines) regenerates byte-identically and apply-checks vs `bbe2ab4d6` |
+| AC1 engine boots + logits parity | ✅ **PASS** — 656 B pages, our decode ran, cosine 0.999999 teacher-forced |
+| AC2 pool ≥1.9× | ❌ as written — **1.756×** is the format's ceiling (~1.63× effective) |
+| AC3 speed ≥95 %/100 % | ❌ — **0.84–0.93×**; not recoverable by tuning (BLOCK_N ≥ 64 does not fit sm_86) |
+| AC5 no non-Ampere regression | ◻ argued statically (`IS_FP8` defaults False); never tested on non-Ampere hardware |
+| AC7 upstream package | ✅ [#48364](https://github.com/vllm-project/vllm/issues/48364) + [#48366](https://github.com/vllm-project/vllm/pull/48366) (NaN bug + fix) and [#48374](https://github.com/vllm-project/vllm/issues/48374) (RFC) |
 | AC9 pre-flight | ✅ gap real and upstream-declared |
-| AC4 (TP+DP+PP+MTP+graph), AC6 (128K), AC8 | not reached |
+| AC4 (TP+DP+PP+MTP+graph), AC6 (128K e2e), AC8 | not reached |
 
-The question the project set out to answer — *can Ampere read fp8 KV pages
-correctly inside vLLM's kernels?* — is answered **yes** at kernel level, with
-a verified 0.999996 correctness chain over vLLM's own writer and layout. The
-questions that remain open are **engine boot** (AC1) and **decode speed**
-(currently 0.45–0.92×, with an untested tuning hypothesis). On a 24 GB card
-the capacity-for-speed trade may already be worth it; the honest numbers to
-decide with are the ones above.
+**The trade, stated plainly:** on a 24 GB card, fp8 KV buys **1.76× KV capacity
+(≈1.63× in practice) for ~10–15 % of decode speed**, with correctness verified
+end-to-end inside a real vLLM engine (cosine 0.999999). Whether that is worth it
+depends on whether you are context-bound or latency-bound. On a 3090 serving
+long-context GLM-5.2, it is: the alternative is not "faster decode", it is "does
+not fit".
